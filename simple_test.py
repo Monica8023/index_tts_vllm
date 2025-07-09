@@ -33,7 +33,7 @@ class TTSStressTester:
         start_time = time.time()
         try:
             # 生成随机数字符串，确保不触发 vllm 的 cache
-            self.data["text"] = ",".join(["".join([str(random.randint(0, 9)) for _ in range(5)]) for _ in range(1)])
+            self.data["text"] = ",".join(["".join([str(random.randint(0, 9)) for _ in range(5)]) for _ in range(5)])
             target_url = self._get_next_url()  # 获取轮询后的URL
             response = requests.post(target_url, json=self.data, timeout=10)
             elapsed = time.time() - start_time

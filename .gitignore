@@ -4,8 +4,8 @@ __pycache__/
 outputs/
 temp.py
 
-assets/
+# assets/
 
-temp_gpt2.py
+temp_gpt2.py    
 
 smoothquart.py

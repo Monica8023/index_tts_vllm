@@ -33,7 +33,10 @@ async def lifespan(app: FastAPI):
         speaker_dict = json.load(open(speaker_path, 'r'))
 
         for speaker, audio_paths in speaker_dict.items():
-            tts.registry_speaker(speaker, audio_paths)
+            audio_paths_ = []
+            for audio_path in audio_paths:
+                audio_paths_.append(os.path.join(cur_dir, audio_path))
+            tts.registry_speaker(speaker, audio_paths_)
     yield
     # Clean up the ML models and release the resources
     # ml_models.clear()
