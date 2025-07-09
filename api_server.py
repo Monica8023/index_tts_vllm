@@ -41,6 +41,38 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+@app.get("/health")
+async def health_check():
+    """健康检查接口"""
+    try:
+        global tts
+        if tts is None:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "unhealthy",
+                    "message": "TTS model not initialized"
+                }
+            )
+        
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "healthy",
+                "message": "Service is running",
+                "timestamp": time.time()
+            }
+        )
+    except Exception as ex:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "error": str(ex)
+            }
+        )
+
+
 @app.post("/tts_url", responses={
     200: {"content": {"application/octet-stream": {}}},
     500: {"content": {"application/json": {}}}

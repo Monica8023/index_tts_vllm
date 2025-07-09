@@ -1,4 +1,4 @@
-MODEL_DIR="/path/to/IndexTeam/Index-TTS"
+MODEL_DIR=$1
 VLLM_DIR="$MODEL_DIR/vllm"
 
 mkdir -p "$VLLM_DIR"
@@ -9,3 +9,4 @@ wget https://modelscope.cn/models/openai-community/gpt2/resolve/master/tokenizer
 python convert_hf_format.py --model_dir "$MODEL_DIR"
 
 echo "All operations completed successfully!"
+

@@ -65,10 +65,9 @@ pip install -r requirements.txt
 | [😁IndexTTS-1.5](https://huggingface.co/IndexTeam/IndexTTS-1.5) | [IndexTTS-1.5](https://modelscope.cn/models/IndexTeam/IndexTTS-1.5) |
 
 ### 6. 模型权重转换
-将 [`convert_hf_format.sh`](convert_hf_format.sh) 中的 `MODEL_DIR` 修改为模型权重下载路径，然后运行：
 
 ```bash
-bash convert_hf_format.sh
+bash convert_hf_format.sh /path/to/your/model_dir
 ```
 
 此操作会将官方的模型权重转换为 transformers 库兼容的版本，保存在模型权重路径下的 `vllm` 文件夹中，方便后续 vllm 库加载模型权重
