@@ -171,7 +171,11 @@ class IndexTTS:
         # print("filtered_latent", filtered_latent.shape)
         return filtered_latent
 
-    async def infer(self, audio_prompt: List[str], text, output_path=None, verbose=False):
+    async def infer(self, audio_prompt: List[str], text, output_path=None, verbose=False, seed=None):
+        # 设置随机种子
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
         print(">> start inference...")
         start_time = time.perf_counter()
 
@@ -270,7 +274,11 @@ class IndexTTS:
             wav_data = trim_and_pad_silence(wav_data)
             return (sampling_rate, wav_data)
         
-    async def infer_with_ref_audio_embed(self, speaker: str, text):
+    async def infer_with_ref_audio_embed(self, speaker: str, text, seed=None):
+        # 设置随机种子
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
         start_time = time.perf_counter()
         text = text.replace("嗯", "EN4")
         text = text.replace("嘿", "HEI1")
