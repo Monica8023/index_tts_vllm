@@ -94,11 +94,9 @@ async def tts_api_url(request: Request):
         data = await request.json()
         text = data["text"]
         audio_paths = data["audio_paths"]
-        # 获取随机种子参数，如果不存在则使用None
-        seed = data.get("seed")
 
         global tts
-        sr, wav = await tts.infer(audio_paths, text, seed=seed)
+        sr, wav = await tts.infer(audio_paths, text)
         
         with io.BytesIO() as wav_buffer:
             sf.write(wav_buffer, wav, sr, format='WAV')
@@ -126,11 +124,9 @@ async def tts_api(request: Request):
         data = await request.json()
         text = data["text"]
         character = data["character"]
-        # 获取随机种子参数，如果不存在则使用None
-        seed = data.get("seed")
 
         global tts
-        sr, wav = await tts.infer_with_ref_audio_embed(character, text, seed=seed)
+        sr, wav = await tts.infer_with_ref_audio_embed(character, text)
         
         with io.BytesIO() as wav_buffer:
             sf.write(wav_buffer, wav, sr, format='WAV')
