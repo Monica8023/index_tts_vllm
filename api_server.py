@@ -94,7 +94,7 @@ async def tts_api_url(request: Request):
         data = await request.json()
         text = data["text"]
         audio_paths = data["audio_paths"]
-        seed = data.get("seed", 5)
+        seed = data.get("seed", 4)
 
         global tts
         sr, wav = await tts.infer(audio_paths, text, seed=seed)
