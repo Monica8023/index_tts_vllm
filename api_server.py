@@ -8,6 +8,7 @@ import traceback
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from contextlib import asynccontextmanager
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import argparse
 import json
@@ -43,6 +44,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# 添加CORS中间件配置
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 允许所有来源，生产环境建议改为具体域名
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/health")
 async def health_check():
@@ -85,9 +94,10 @@ async def tts_api_url(request: Request):
         data = await request.json()
         text = data["text"]
         audio_paths = data["audio_paths"]
+        seed = data.get("seed", 8)
 
         global tts
-        sr, wav = await tts.infer(audio_paths, text)
+        sr, wav = await tts.infer(audio_paths, text, seed=seed)
         
         with io.BytesIO() as wav_buffer:
             sf.write(wav_buffer, wav, sr, format='WAV')

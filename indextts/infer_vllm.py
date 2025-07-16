@@ -171,7 +171,7 @@ class IndexTTS:
         # print("filtered_latent", filtered_latent.shape)
         return filtered_latent
 
-    async def infer(self, audio_prompt: List[str], text, output_path=None, verbose=False):
+    async def infer(self, audio_prompt: List[str], text, output_path=None, verbose=False, seed=None):
         print(">> start inference...")
         start_time = time.perf_counter()
 
@@ -211,7 +211,11 @@ class IndexTTS:
 
             m_start_time = time.perf_counter()
             with torch.no_grad():
-                # with torch.amp.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+                # 设置采样参数的seed
+                if seed is not None:
+                    self.gpt.sampling_params.seed = int(seed)
+                else:
+                    self.gpt.sampling_params.seed = None
                 codes, latent = await self.gpt.inference_speech(
                     speech_conditioning_latent,
                     text_tokens,
