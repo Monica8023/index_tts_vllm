@@ -84,6 +84,12 @@ VLLM_USE_V1=0 python webui.py
 
 
 ## API
+
+- **[2025-08-06]** 支持 openai 接口格式调用：
+    1. 添加 /audio/speech api 路径，兼容 OpenAI 接口
+    2. 添加 /audio/voices api 路径， 获得 voice/character 列表
+    - 对应：[createSpeech](https://platform.openai.com/docs/api-reference/audio/createSpeech)
+
 使用 fastapi 封装了 api 接口，启动示例如下：
 
 ```bash
