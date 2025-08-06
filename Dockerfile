@@ -1,4 +1,5 @@
-FROM vllm/vllm-openai:latest
+# FROM vllm/vllm-openai:latest
+FROM vllm/vllm-openai:v0.9.0
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \

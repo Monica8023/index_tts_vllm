@@ -146,6 +146,56 @@ async def tts_api(request: Request):
             }
         )
 
+
+
+@app.get("/audio/voices")
+async def tts_voices():
+    """ additional function to provide the list of available voices, in the form of JSON """
+    current_file_path = os.path.abspath(__file__)
+    cur_dir = os.path.dirname(current_file_path)
+    speaker_path = os.path.join(cur_dir, "assets/speaker.json")
+    if os.path.exists(speaker_path):
+        speaker_dict = json.load(open(speaker_path, 'r'))
+        return speaker_dict
+    else:
+        return []
+
+
+
+@app.post("/audio/speech", responses={
+    200: {"content": {"application/octet-stream": {}}},
+    500: {"content": {"application/json": {}}}
+})
+async def tts_api_openai(request: Request):
+    """ OpenAI competible API, see: https://api.openai.com/v1/audio/speech """
+    try:
+        data = await request.json()
+        text = data["input"]
+        character = data["voice"]
+        #model param is omitted
+        _model = data["model"]
+
+        global tts
+        sr, wav = await tts.infer_with_ref_audio_embed(character, text)
+        
+        with io.BytesIO() as wav_buffer:
+            sf.write(wav_buffer, wav, sr, format='WAV')
+            wav_bytes = wav_buffer.getvalue()
+
+        return Response(content=wav_bytes, media_type="audio/wav")
+    
+    except Exception as ex:
+        tb_str = ''.join(traceback.format_exception(type(ex), ex, ex.__traceback__))
+        print(tb_str)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "error": str(tb_str)
+            }
+        )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", type=str, default="0.0.0.0")
