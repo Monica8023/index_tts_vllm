@@ -1,5 +1,7 @@
 #!/bin/bash
 
+#need to set alias within container
+alias python=python3
 # Set default values if environment variables are not set
 MODEL_DIR=${MODEL_DIR:-"assets/checkpoints/"}
 MODEL=${MODEL:-"IndexTeam/IndexTTS-1.5"}
@@ -27,7 +29,7 @@ check_model_exists() {
     fi
     
     # Check for essential model files
-    if [ ! -f "$MODEL_DIR/config.yaml" ] || [ ! -f "$MODEL_DIR/gpt_ckpt.ckpt" ] || [ ! -f "$MODEL_DIR/bigvgan_ckpt.ckpt" ]; then
+    if [ ! -f "$MODEL_DIR/config.yaml" ] || [ ! -f "$MODEL_DIR/gpt.pth" ] || [ ! -f "$MODEL_DIR/bigvgan_generator.pth" ]; then
         echo "Essential model files not found in $MODEL_DIR"
         return 1
     fi
@@ -113,17 +115,18 @@ fi
 if [ "$CONVERT_MODEL" = "1" ]; then
     if ! check_conversion_complete; then
         echo "Converting model format..."
-        if [ -f "convert_hf_format.sh" ]; then
-            if bash convert_hf_format.sh "$MODEL_DIR"; then
-                # Create conversion marker file on success
-                touch "$MODEL_DIR/.conversion_complete"
-                echo "Model conversion completed successfully"
-            else
-                echo "Error: Model conversion failed"
-                exit 1
-            fi
+        # Run conversion and capture the exit code
+        bash convert_hf_format.sh "$MODEL_DIR"
+        conversion_exit_code=$?
+        
+        # Check if conversion was successful by verifying the vllm directory exists
+        if [ $conversion_exit_code -eq 0 ] && [ -d "$MODEL_DIR/vllm" ] && [ -f "$MODEL_DIR/vllm/model.safetensors" ]; then
+            # Create conversion marker file on success
+            touch "$MODEL_DIR/.conversion_complete"
+            echo "Model conversion completed successfully"
         else
-            echo "Warning: convert_hf_format.sh not found, skipping conversion"
+            echo "Error: Model conversion failed (exit code: $conversion_exit_code)"
+            exit 1
         fi
     else
         echo "Model conversion already completed, skipping"
@@ -134,4 +137,4 @@ fi
 
 # Start the API server
 echo "Starting IndexTTS API server on port $PORT..."
-VLLM_USE_V1=0 python3 api_server.py --model_dir "$MODEL_DIR" --port "$PORT"
+VLLM_USE_V1=0 python3 api_server.py --model_dir "$MODEL_DIR" --port "$PORT" --gpu_memory_utilization="$GPU_MEMORY_UTILIZATION"
