@@ -26,6 +26,15 @@ Word Error Rate (WER) Results for IndexTTS and Baseline Models on the [**seed-te
 
 基本保持了原项目的性能
 
+## 更新日志
+
+- **[2025-08-07]** 支持 Docker 全自动化一键部署 API 服务：`docker compose up`
+
+- **[2025-08-06]** 支持 openai 接口格式调用：
+    1. 添加 /audio/speech api 路径，兼容 OpenAI 接口
+    2. 添加 /audio/voices api 路径， 获得 voice/character 列表
+    - 对应：[createSpeech](https://platform.openai.com/docs/api-reference/audio/createSpeech)
+
 ## 使用步骤
 
 ### 1. git 本项目
@@ -85,11 +94,6 @@ VLLM_USE_V1=0 python webui.py
 
 ## API
 
-- **[2025-08-06]** 支持 openai 接口格式调用：
-    1. 添加 /audio/speech api 路径，兼容 OpenAI 接口
-    2. 添加 /audio/voices api 路径， 获得 voice/character 列表
-    - 对应：[createSpeech](https://platform.openai.com/docs/api-reference/audio/createSpeech)
-
 使用 fastapi 封装了 api 接口，启动示例如下：
 
 ```bash
@@ -121,6 +125,12 @@ response = requests.post(url, json=data)
 with open("output.wav", "wb") as f:
     f.write(response.content)
 ```
+
+### OpenAI API
+- 添加 /audio/speech api 路径，兼容 OpenAI 接口
+- 添加 /audio/voices api 路径， 获得 voice/character 列表
+
+详见：[createSpeech](https://platform.openai.com/docs/api-reference/audio/createSpeech)
 
 ## 并发测试
 参考 [`simple_test.py`](simple_test.py)，需先启动 API 服务
