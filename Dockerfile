@@ -9,18 +9,21 @@ RUN apt-get update && \
     libsm6 \
     libxext6 \
     && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* && \
+    ln -sf /usr/bin/python3 /usr/bin/python
 
 WORKDIR /app
 
 COPY requirements.txt requirements.txt
 RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 
-COPY assets /app/assets
+# COPY assets /app/assets
 COPY indextts /app/indextts
 COPY tools /app/tools
 COPY patch_vllm.py /app/patch_vllm.py
 COPY api_server.py /app/api_server.py
+COPY convert_hf_format.py /app/convert_hf_format.py
+COPY convert_hf_format.sh /app/convert_hf_format.sh
 COPY entrypoint.sh /app/entrypoint.sh
 
 ENTRYPOINT /app/entrypoint.sh

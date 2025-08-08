@@ -4,9 +4,11 @@ services:
   index-tts:
     build: .
     image: index-tts-server
+    env_file:
+      - .env.example
     container_name: index-tts-server
     ports:
-      - "8001:8001"
+      - "${PORT:-8001}:${PORT:-8001}"
     deploy:
       resources:
         reservations:
@@ -14,12 +16,12 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    # volumes:
+    volumes:
     #   - ./audio_prompts:/app/audio_prompts
-    #   - ./checkpoints:/app/checkpoints
+      - ./assets:/app/assets
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:${PORT:-8001}/health"]
       interval: 30s
       timeout: 10s
       retries: 3
