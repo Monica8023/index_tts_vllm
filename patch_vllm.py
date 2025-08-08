@@ -12,7 +12,7 @@ if vllm_version > version.parse("0.7.3"):
 else:
     from indextts.gpt.index_tts_gpt2 import GPT2TTSModel
 ModelRegistry.register_model("GPT2InferenceModel", GPT2TTSModel)
-print("✅ Registry GPT2TTSModel to vllm")
+print("✅  Registry GPT2TTSModel to vllm")
 
 
 
@@ -30,7 +30,7 @@ def patched_verify_args(self) -> None:
         self.repetition_penalty = repetition_penalty_temp
 
 SamplingParams._verify_args = patched_verify_args
-print("⚠️  SamplingParams._verify_args Patched")
+print("✅  SamplingParams._verify_args Patched")
 
 
 
@@ -49,7 +49,7 @@ print("⚠️  SamplingParams._verify_args Patched")
 #     return (seq_group_metadata_list, scheduler_outputs, allow_async_output_proc)
 
 # Scheduler.schedule = patched_schedule
-# print("⚠️  Scheduler.schedule Patched")
+# print("✅  Scheduler.schedule Patched")
 
 
 # 将 position_ids 减去 prefill 的长度再加 2，以便计算每一步 decode 的 position embed
@@ -105,7 +105,7 @@ def patched_compute_lens(self, inter_data: ModelInputForGPUBuilder.InterDataForS
             )
 
 ModelInputForGPUBuilder._compute_lens = patched_compute_lens
-print("⚠️  ModelInputForGPUBuilder._compute_lens Patched")
+print("✅  ModelInputForGPUBuilder._compute_lens Patched")
 
 
 
@@ -139,7 +139,7 @@ print("⚠️  ModelInputForGPUBuilder._compute_lens Patched")
 #     )
 
 # GPUModelRunnerBase.__init__ = patched_gpu_runner_init
-# print("⚠️  GPUModelRunnerBase.__init__ Patched")
+# print("✅  GPUModelRunnerBase.__init__ Patched")
 
 
 # # 2. 进一步将 hidden_states 传到 RequestOutput 中
@@ -156,7 +156,7 @@ print("⚠️  ModelInputForGPUBuilder._compute_lens Patched")
 # #     self.hidden_states = None
 
 # # RequestOutput.__init__ = new_init
-# # print("⚠️  RequestOutput.__init__ Patched")
+# # print("✅  RequestOutput.__init__ Patched")
 
 # # prefill 阶段走这条路
 # async def patched_step_async(
@@ -312,7 +312,7 @@ print("⚠️  ModelInputForGPUBuilder._compute_lens Patched")
 #         return ctx.request_outputs
 
 # _AsyncLLMEngine.step_async = patched_step_async
-# print("⚠️  _AsyncLLMEngine.step_async Patched")
+# print("✅  _AsyncLLMEngine.step_async Patched")
 
 
 # # decode 阶段会走这条路
@@ -563,4 +563,4 @@ print("⚠️  ModelInputForGPUBuilder._compute_lens Patched")
 #         return None
 
 # LLMEngine._process_model_outputs = patched_process_model_outputs
-# print("⚠️  LLMEngine._process_model_outputs Patched")
+# print("✅  LLMEngine._process_model_outputs Patched")
