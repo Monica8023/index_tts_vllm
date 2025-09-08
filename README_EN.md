@@ -5,6 +5,8 @@
 # IndexTTS-vLLM
 </div>
 
+Working on IndexTTS2 support, coming soon... 0.0
+
 ## Introduction
 This project reimplements the inference of the GPT model from [index-tts](https://github.com/index-tts/index-tts) using the vllm library, accelerating the inference process of index-tts.
 
