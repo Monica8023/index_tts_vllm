@@ -5,6 +5,8 @@
 # IndexTTS-vLLM
 </div>
 
+Working on IndexTTS2 support, coming soon... 0.0
+
 ## 项目简介
 该项目在 [index-tts](https://github.com/index-tts/index-tts) 的基础上使用 vllm 库重新实现了 gpt 模型的推理，加速了 index-tts 的推理过程。
 
