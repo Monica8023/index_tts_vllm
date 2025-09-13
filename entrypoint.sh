@@ -3,7 +3,7 @@
 #need to set alias within container
 alias python=python3
 # Set default values if environment variables are not set
-MODEL_DIR=${MODEL_DIR:-"assets/checkpoints/"}
+MODEL_DIR=${MODEL_DIR:-"checkpoints/"}
 MODEL=${MODEL:-"IndexTeam/IndexTTS-1.5"}
 VLLM_USE_MODELSCOPE=${VLLM_USE_MODELSCOPE:-1}
 DOWNLOAD_MODEL=${DOWNLOAD_MODEL:-1}

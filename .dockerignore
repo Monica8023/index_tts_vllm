@@ -4,4 +4,4 @@ __pycache__
 .gitignore
 *.pyc
 
-assets/checkpoints
+checkpoints
