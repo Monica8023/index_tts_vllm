@@ -9,7 +9,7 @@ vllm_version = version.parse(importlib.import_module("vllm").__version__)
 
 # 在 vllm 中注册自定义的 GPT2TTSModel
 from vllm import ModelRegistry
-from indextts.gpt.index_tts_gpt2_simple import GPT2TTSModel
+from indextts.gpt.index_tts_gpt2_vllm_v1 import GPT2TTSModel
 
 ModelRegistry.register_model("GPT2InferenceModel", GPT2TTSModel)
 print("✅  Registry GPT2TTSModel to vllm")

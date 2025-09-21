@@ -6,7 +6,6 @@
 </div>
 
 Working on IndexTTS2 support, coming soon... 0.0
-- [2025-09-22] 支持了 vllm v1 版本，但并发情况下会报错，建议先使用 IndexTTS-vLLM-1.0 Releases。 IndexTTS2仍在兼容中
 
 ## 项目简介
 该项目在 [index-tts](https://github.com/index-tts/index-tts) 的基础上使用 vllm 库重新实现了 gpt 模型的推理，加速了 index-tts 的推理过程。
@@ -14,7 +13,7 @@ Working on IndexTTS2 support, coming soon... 0.0
 推理速度在单卡 RTX 4090 上的提升为：
 - 单个请求的 RTF (Real-Time Factor)：≈0.3 -> ≈0.1
 - 单个请求的 gpt 模型 decode 速度：≈90 token / s -> ≈280 token / s
-- 并发量：gpu_memory_utilization设置为0.5（约12GB显存）的情况下，vllm 显示 `Maximum concurrency for 608 tokens per request: 237.18x`，两百多并发，man！当然考虑 TTFT 以及其他推理成本（bigvgan 等），实测 16 左右的并发无压力（测速脚本参考 `simple_test.py`）
+- 并发量：gpu_memory_utilization设置为0.25（约5GB显存）的情况下，实测 16 左右的并发无压力（测速脚本参考 `simple_test.py`）
 
 ## 新特性
 - 支持多角色音频混合：可以传入多个参考音频，TTS 输出的角色声线为多个参考音频的混合版本（输入多个参考音频会导致输出的角色声线不稳定，可以抽卡抽到满意的声线再作为参考音频）
@@ -40,6 +39,8 @@ Word Error Rate (WER) Results for IndexTTS and Baseline Models on the [**seed-te
     2. 添加 /audio/voices api 路径， 获得 voice/character 列表
     - 对应：[createSpeech](https://platform.openai.com/docs/api-reference/audio/createSpeech)
 
+- **[2025-09-22]** 支持了 vllm v1 版本，IndexTTS2 正在兼容中
+
 ## 使用步骤
 
 ### 1. git 本项目
@@ -58,9 +59,7 @@ conda activate index-tts-vllm
 
 ### 3. 安装 pytorch
 
-优先建议安装 pytorch 2.7.0（对应 vllm 0.9.0），具体安装指令请参考：[pytorch 官网](https://pytorch.org/get-started/locally/)
-
-若显卡不支持，请安装 pytorch 2.5.1（对应 vllm 0.7.3），并将 [requirements.txt](requirements.txt) 中 `vllm==0.9.0` 修改为 `vllm==0.7.3`
+需要 pytorch 版本 2.8.0（对应 vllm 0.10.2），具体安装指令请参考：[pytorch 官网](https://pytorch.org/get-started/locally/)
 
 
 ### 4. 安装依赖
@@ -90,46 +89,27 @@ bash convert_hf_format.sh /path/to/your/model_dir
 将 [`webui.py`](webui.py) 中的 `model_dir` 修改为模型权重下载路径，然后运行：
 
 ```bash
-VLLM_USE_V1=0 python webui.py
+python webui.py
 ```
 第一次启动可能会久一些，因为要对 bigvgan 进行 cuda 核编译
-
-注：一定要带上 `VLLM_USE_V1=0` ，因为本项目没有对 vllm 的 v1 版本做兼容
 
 
 ## API
 
-使用 fastapi 封装了 api 接口，启动示例如下：
+使用 fastapi 封装了 api 接口，启动示例如下，请将 `--model_dir` 改为你的模型的实际路径：
 
 ```bash
-VLLM_USE_V1=0 python api_server.py --model_dir /your/path/to/Index-TTS --port 11996
+python api_server.py model_dir /your/path/to/Index-TTS
 ```
 
-注：一定要带上 `VLLM_USE_V1=0` ，因为本项目没有对 vllm 的 v1 版本做兼容
-
 ### 启动参数
-- `--model_dir`: 模型权重下载路径
-- `--host`: 服务ip地址
-- `--port`: 服务端口
+- `--model_dir`: 必填，模型权重路径
+- `--host`: 服务ip地址，默认为 `6006`
+- `--port`: 服务端口，默认为 `0.0.0.0`
 - `--gpu_memory_utilization`: vllm 显存占用率，默认设置为 `0.25`
 
 ### 请求示例
-```python
-import requests
-
-url = "http://0.0.0.0:11996/tts_url"
-data = {
-    "text": "还是会想你，还是想登你",
-    "audio_paths": [  # 支持多参考音频
-        "audio1.wav",
-        "audio2.wav"
-    ]
-}
-
-response = requests.post(url, json=data)
-with open("output.wav", "wb") as f:
-    f.write(response.content)
-```
+参考 `api_example.py`
 
 ### OpenAI API
 - 添加 /audio/speech api 路径，兼容 OpenAI 接口

@@ -13,7 +13,7 @@ from transformers import GPT2Config, GPT2Model
 from indextts.gpt.conformer_encoder import ConformerEncoder
 from indextts.gpt.perceiver import PerceiverResampler
 
-from indextts.gpt.index_tts_gpt2_simple import PLACEHOLDER_TOKEN, PLACEHOLDER_TOKEN_ID
+from indextts.gpt.index_tts_gpt2_vllm_v1 import PLACEHOLDER_TOKEN, PLACEHOLDER_TOKEN_ID
 
 from vllm import AsyncLLMEngine, SamplingParams, TokensPrompt
 from vllm.v1.engine.async_llm import AsyncLLM

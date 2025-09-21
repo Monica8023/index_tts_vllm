@@ -22,7 +22,8 @@ from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory, make_layers,
-    maybe_prefix
+    maybe_prefix,
+    merge_multimodal_embeddings
 )
 
 from vllm.model_executor.models.gpt2 import GPT2Block  #, GPT2MLP, GPT2Attention
@@ -300,17 +301,24 @@ class GPT2TTSModel(nn.Module, SupportsPP, SupportsMultiModal):
         input_ids: torch.Tensor,
         multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
     ) -> torch.Tensor:
-        # 这个方法现在用于合并文本和多模态 embedding
-        # 在我们的 prefill 场景下，input_ids 是假的，我们只关心 multimodal_embeddings
-        if multimodal_embeddings and len(multimodal_embeddings) > 0:
-            # 假设只有一个多模态输入，并且它就是我们想要的完整 embedding
-            # 如果有多个，需要将它们拼接起来
-            # 注意：vLLM 的 merge_multimodal_embeddings 是用于替换占位符 token 的，
-            # 而我们的场景是整个输入都是 embedding，所以我们直接返回它。
-            return torch.cat(multimodal_embeddings, dim=0)
+        # # 这个方法现在用于合并文本和多模态 embedding
+        # # 在我们的 prefill 场景下，input_ids 是假的，我们只关心 multimodal_embeddings
+        # if multimodal_embeddings is not None:  #  and len(multimodal_embeddings) > 0
+        #     # 假设只有一个多模态输入，并且它就是我们想要的完整 embedding
+        #     # 如果有多个，需要将它们拼接起来
+        #     # 注意：vLLM 的 merge_multimodal_embeddings 是用于替换占位符 token 的，
+        #     # 而我们的场景是整个输入都是 embedding，所以我们直接返回它。
+        #     return torch.cat(multimodal_embeddings, dim=0)
 
-        # 对于 decode 阶段，我们走正常的 embedding lookup
-        return self.audio_emb(input_ids)
+        # # 对于 decode 阶段，我们走正常的 embedding lookup
+        # return self.audio_emb(input_ids)
+        inputs_embeds = self.audio_emb(input_ids)
+        if multimodal_embeddings is not None \
+            and len(multimodal_embeddings) != 0:
+            inputs_embeds = merge_multimodal_embeddings(
+                input_ids, inputs_embeds, multimodal_embeddings,
+                PLACEHOLDER_TOKEN_ID)
+        return inputs_embeds
 
     def forward(
         self,
