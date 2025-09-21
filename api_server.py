@@ -1,6 +1,7 @@
 
 import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+import patch_vllm  # ⚠️ Monkey Patch, do not delete this line
 
 import asyncio
 import io
@@ -25,7 +26,19 @@ tts = None
 async def lifespan(app: FastAPI):
     global tts
     cfg_path = os.path.join(args.model_dir, "config.yaml")
-    tts = IndexTTS(model_dir=args.model_dir, cfg_path=cfg_path, gpu_memory_utilization=args.gpu_memory_utilization)
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.v1.engine.async_llm import AsyncLLM
+
+    vllm_dir = os.path.join(args.model_dir, "vllm")
+    engine_args = AsyncEngineArgs(
+        model=vllm_dir,
+        tensor_parallel_size=1,
+        dtype="auto",
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        # enforce_eager=True,
+    )
+    indextts_vllm = AsyncLLM.from_engine_args(engine_args)
+    tts = IndexTTS(model_dir=args.model_dir, vllm_model=indextts_vllm, cfg_path=cfg_path)
 
     current_file_path = os.path.abspath(__file__)
     cur_dir = os.path.dirname(current_file_path)
@@ -199,7 +212,7 @@ async def tts_api_openai(request: Request):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", type=str, default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=11996)
+    parser.add_argument("--port", type=int, default=6006)
     parser.add_argument("--model_dir", type=str, default="/path/to/IndexTeam/Index-TTS")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.25)
     args = parser.parse_args()

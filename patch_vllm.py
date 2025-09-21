@@ -1,5 +1,7 @@
+
+import torch
 import time
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 from packaging import version
 import importlib
@@ -7,560 +9,272 @@ vllm_version = version.parse(importlib.import_module("vllm").__version__)
 
 # 在 vllm 中注册自定义的 GPT2TTSModel
 from vllm import ModelRegistry
-if vllm_version > version.parse("0.7.3"):
-    from indextts.gpt.index_tts_gpt2_new import GPT2TTSModel
-else:
-    from indextts.gpt.index_tts_gpt2 import GPT2TTSModel
+from indextts.gpt.index_tts_gpt2_simple import GPT2TTSModel
+
 ModelRegistry.register_model("GPT2InferenceModel", GPT2TTSModel)
 print("✅  Registry GPT2TTSModel to vllm")
 
 
+# 将 position_ids 减去 prefill 的长度再加 1，以便计算每一步 decode 的 position embed
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+import numpy as np
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 
-# 解除 vllm 对 repetition_penalty 的限制
-from vllm.sampling_params import SamplingParams
-original_verify_args = SamplingParams._verify_args
-
-def patched_verify_args(self) -> None:
-    repetition_penalty_temp = -1
-    if self.repetition_penalty > 2.0:
-        repetition_penalty_temp = self.repetition_penalty
-        self.repetition_penalty = 2.0
-    original_verify_args(self)
-    if repetition_penalty_temp != -1:
-        self.repetition_penalty = repetition_penalty_temp
-
-SamplingParams._verify_args = patched_verify_args
-print("✅  SamplingParams._verify_args Patched")
-
-
-
-# # 使得每次 forward 都带有传入的 multi_modal_data
-# from vllm.core.scheduler import Scheduler, SchedulerOutputs
-# from vllm.sequence import SequenceGroupMetadata
-# original_schedule = Scheduler.schedule
-
-# def patched_schedule(self) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs, bool]:
-#     seq_group_metadata_list, scheduler_outputs, allow_async_output_proc = original_schedule(self)
-#     for seq_group_metadata, scheduled_seq_group in zip(seq_group_metadata_list, scheduler_outputs.scheduled_seq_groups):
-#         seq_group = scheduled_seq_group.seq_group
-#         seq_group_metadata.multi_modal_data = seq_group.multi_modal_data
-#         # print("seq_group_metadata.multi_modal_data", seq_group_metadata.multi_modal_data)
-
-#     return (seq_group_metadata_list, scheduler_outputs, allow_async_output_proc)
-
-# Scheduler.schedule = patched_schedule
-# print("✅  Scheduler.schedule Patched")
-
-
-# 将 position_ids 减去 prefill 的长度再加 2，以便计算每一步 decode 的 position embed
-from vllm.worker.model_runner import ModelInputForGPUBuilder
-from vllm.sequence import SequenceGroupMetadata
-from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
-
-def patched_compute_lens(self, inter_data: ModelInputForGPUBuilder.InterDataForSeqGroup, seq_idx: int,
-                    seq_group_metadata: SequenceGroupMetadata):
-    """Compute context length, sequence length and tokens
-    for the given sequence data.
+def _prepare_inputs(
+    self,
+    scheduler_output: "SchedulerOutput",
+) -> tuple[dict[str, Any], torch.Tensor, Optional[SpecDecodeMetadata],
+            np.ndarray, Optional[CommonAttentionMetadata], int]:
     """
-    seq_data = seq_group_metadata.seq_data[inter_data.seq_ids[seq_idx]]
-    token_chunk_size = seq_group_metadata.token_chunk_size
+    :return: tuple[
+        attn_metadata: layer-to-attention_metadata mapping,
+        logits_indices, spec_decode_metadata
+    ]
+    """
+    total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+    assert total_num_scheduled_tokens > 0
+    num_reqs = self.input_batch.num_reqs
+    assert num_reqs > 0
 
-    # Compute context length (the number of tokens that are
-    # already computed) and sequence length (total number of tokens).
+    # OPTIMIZATION: Start copying the block table first.
+    # This way, we can overlap the copy with the following CPU operations.
+    self.input_batch.block_table.commit_block_table(num_reqs)
 
-    seq_len = seq_data.get_len()
-    if inter_data.is_prompt:
-        context_len = seq_data.get_num_computed_tokens()
-        seq_len = min(seq_len, context_len + token_chunk_size)
-    elif self.runner.scheduler_config.is_multi_step or \
-        self.runner.model_config.is_encoder_decoder:
-        context_len = seq_len - 1
+    # Get the number of scheduled tokens for each request.
+    req_ids = self.input_batch.req_ids
+    tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+    num_scheduled_tokens = np.array(tokens, dtype=np.int32)
+    max_num_scheduled_tokens = max(tokens)
+
+    # Get request indices.
+    # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
+    req_indices = np.repeat(self.arange_np[:num_reqs],
+                            num_scheduled_tokens)
+
+    # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]
+    # arange: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+    cu_num_tokens, arange = self._get_cumsum_and_arange(
+        num_scheduled_tokens)
+
+    # Get positions.
+    positions_np = self.positions.np[:total_num_scheduled_tokens]
+    np.add(self.input_batch.num_computed_tokens_cpu[req_indices],
+            arange,
+            out=positions_np)
+
+    # Calculate M-RoPE positions.
+    # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
+    if self.uses_mrope:
+        self._calc_mrope_positions(scheduler_output)
+
+    # Get token indices.
+    # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+    # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
+    # where M is the max_model_len.
+    token_indices = (positions_np +
+                        req_indices * self.input_batch.token_ids_cpu.shape[1])
+
+    # NOTE(woosuk): We use torch.index_select instead of np.take here
+    # because torch.index_select is much faster than np.take for large
+    # tensors.
+    torch.index_select(self.input_batch.token_ids_cpu_tensor.flatten(),
+                        0,
+                        torch.from_numpy(token_indices),
+                        out=self.input_ids.cpu[:total_num_scheduled_tokens])
+
+    self.input_batch.block_table.compute_slot_mapping(
+        req_indices, positions_np)
+    self.input_batch.block_table.commit_slot_mapping(
+        total_num_scheduled_tokens)
+
+    # GPT2TTSModel 修改位置编码
+    model = self.get_model()
+    if isinstance(model, GPT2TTSModel):
+        # req_ids_in_batch = self.input_batch.req_ids[:num_reqs]
+        prompt_tokens_offset = []
+        for req_id in self.input_batch.req_ids:
+            prompt_tokens_offset.append(-(len(self.requests[req_id].prompt_token_ids) - 1))
+            # print(f"[{idx}] self.requests[req_id].prompt_token_ids:", len(self.requests[req_id].prompt_token_ids), positions_np)
+        np.add(np.array(prompt_tokens_offset)[req_indices],
+                positions_np,
+                out=positions_np)
+
+    # Prepare the attention metadata.
+    self.query_start_loc.np[0] = 0
+    self.query_start_loc.np[1:num_reqs + 1] = cu_num_tokens
+    # Note: pad query_start_loc to be non-decreasing, as kernels
+    # like FlashAttention requires that
+    self.query_start_loc.np[num_reqs + 1:].fill(cu_num_tokens[-1])
+    self.query_start_loc.copy_to_gpu()
+    query_start_loc = self.query_start_loc.gpu[:num_reqs + 1]
+
+    self.seq_lens.np[:num_reqs] = (
+        self.input_batch.num_computed_tokens_cpu[:num_reqs] +
+        num_scheduled_tokens)
+    # Fill unused with 0 for full cuda graph mode.
+    self.seq_lens.np[num_reqs:].fill(0)
+    self.seq_lens.copy_to_gpu()
+    seq_lens = self.seq_lens.gpu[:num_reqs]
+    max_seq_len = self.seq_lens.np[:num_reqs].max().item()
+
+    # Copy the tensors to the GPU.
+    self._prepare_input_ids(total_num_scheduled_tokens, cu_num_tokens)
+
+    if self.uses_mrope:
+        # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
+        self.mrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
+            self.mrope_positions.cpu[:, :total_num_scheduled_tokens],
+            non_blocking=True)
     else:
-        context_len = seq_data.get_num_computed_tokens()
+        # Common case (1D positions)
+        self.positions.copy_to_gpu(total_num_scheduled_tokens)
 
-    # Compute tokens.
-    tokens = seq_data.get_token_ids()[context_len:seq_len]
-    token_types = seq_group_metadata.token_type_ids
+    use_spec_decode = len(
+        scheduler_output.scheduled_spec_decode_tokens) > 0
+    if not use_spec_decode:
+        # NOTE(woosuk): Due to chunked prefills, the batch may contain
+        # partial requests. While we should not sample any token
+        # from these partial requests, we do so for simplicity.
+        # We will ignore the sampled tokens from the partial requests.
+        # TODO: Support prompt logprobs.
+        logits_indices = query_start_loc[1:] - 1
+        num_draft_tokens = None
+        spec_decode_metadata = None
+    else:
+        # Get the number of draft tokens for each request.
+        # Iterate over the dictionary rather than all requests since not all
+        # requests have draft tokens.
+        num_draft_tokens = np.zeros(num_reqs, dtype=np.int32)
+        for req_id, draft_token_ids in (
+                scheduler_output.scheduled_spec_decode_tokens.items()):
+            req_idx = self.input_batch.req_id_to_index[req_id]
+            num_draft_tokens[req_idx] = len(draft_token_ids)
 
-    inter_data.seq_lens[seq_idx] = seq_len
-    inter_data.orig_seq_lens[seq_idx] = seq_len
-    inter_data.context_lens[seq_idx] = context_len
-    inter_data.input_tokens[seq_idx].extend(tokens)
-    # inter_data.input_positions[seq_idx].extend(range(context_len, seq_len))
-    pos_bias = seq_data.get_prompt_len() - 2
-    inter_data.input_positions[seq_idx].extend(range(context_len-pos_bias, seq_len-pos_bias))
-    inter_data.token_types[seq_idx].extend(
-        token_types if token_types else [])
-    inter_data.query_lens[seq_idx] = seq_len - context_len
+        spec_decode_metadata = self._calc_spec_decode_metadata(
+            num_draft_tokens, cu_num_tokens)
+        logits_indices = spec_decode_metadata.logits_indices
+        self.num_draft_tokens.np[:num_reqs] = num_draft_tokens
+        self.num_draft_tokens.np[num_reqs:].fill(0)
+        self.num_draft_tokens.copy_to_gpu()
 
-    if seq_data.mrope_position_delta is not None:
-        if inter_data.mrope_input_positions is None:
-            inter_data.mrope_input_positions = [None] * inter_data.n_seqs
+    logits_indices_padded = None
+    if self.cache_config.kv_sharing_fast_prefill:
+        logits_indices_padded = self._prepare_kv_sharing_fast_prefill(
+            logits_indices)
 
-        inter_data.mrope_input_positions[
-            seq_idx] = MRotaryEmbedding.get_next_input_positions(
-                seq_data.mrope_position_delta,
-                context_len,
-                seq_len,
+    attn_metadata: dict[str, Any] = {}
+
+    # Used in the below loop.
+    query_start_loc_cpu = self.query_start_loc.cpu[:num_reqs + 1]
+    seq_lens_cpu = self.seq_lens.cpu[:num_reqs]
+    num_computed_tokens_cpu = (
+        self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs])
+    spec_decode_common_attn_metadata = None
+    if use_spec_decode:
+        self.num_accepted_tokens.np[:num_reqs] = (
+            self.input_batch.num_accepted_tokens_cpu[:num_reqs])
+        self.num_accepted_tokens.np[num_reqs:].fill(1)
+        self.num_accepted_tokens.copy_to_gpu()
+
+    # Prepare the attention metadata for each KV cache group and make layers
+    # in the same group share the same metadata.
+    for kv_cache_group_id, kv_cache_group_spec in enumerate(
+            self.kv_cache_config.kv_cache_groups):
+        encoder_seq_lens = self._get_encoder_seq_lens(
+            scheduler_output, kv_cache_group_spec.kv_cache_spec, num_reqs)
+
+        if isinstance(kv_cache_group_spec.kv_cache_spec,
+                        EncoderOnlyAttentionSpec):
+            # Encoder-only layers do not have KV cache, so we need to
+            # create a dummy block table and slot mapping for them.
+            blk_table_tensor = torch.zeros(
+                (num_reqs, 1),
+                dtype=torch.int32,
+                device=self.device,
             )
+            slot_mapping = torch.zeros(
+                (total_num_scheduled_tokens, ),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            num_common_prefix_blocks = 0
+        else:
+            blk_table = self.input_batch.block_table[kv_cache_group_id]
+            blk_table_tensor = blk_table.get_device_tensor()[:num_reqs]
+            slot_mapping = blk_table.slot_mapping[:
+                                                    total_num_scheduled_tokens]
+
+            # Fill unused with -1. Needed for reshape_and_cache in full cuda
+            # graph mode.
+            blk_table.slot_mapping[total_num_scheduled_tokens:].fill_(-1)
+            num_common_prefix_blocks = (
+                scheduler_output.
+                num_common_prefix_blocks[kv_cache_group_id])
+
+        common_attn_metadata = CommonAttentionMetadata(
+            query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            num_computed_tokens_cpu=num_computed_tokens_cpu,
+            num_reqs=num_reqs,
+            num_actual_tokens=total_num_scheduled_tokens,
+            max_query_len=max_num_scheduled_tokens,
+            max_seq_len=max_seq_len,
+            block_table_tensor=blk_table_tensor,
+            slot_mapping=slot_mapping,
+            logits_indices_padded=logits_indices_padded,
+            num_logits_indices=logits_indices.size(0),
+            causal=True,
+            encoder_seq_lens=encoder_seq_lens,
+        )
+
+        if self.speculative_config and \
+            spec_decode_common_attn_metadata is None:
+            spec_decode_common_attn_metadata = common_attn_metadata
+
+        for attn_group in self.attn_groups[kv_cache_group_id]:
+            # Prepare for cascade attention if enabled & beneficial.
+            common_prefix_len = 0
+            builder = attn_group.metadata_builder
+            if self.cascade_attn_enabled:
+                common_prefix_len = self._compute_cascade_attn_prefix_len(
+                    num_scheduled_tokens,
+                    num_common_prefix_blocks,
+                    kv_cache_group_spec.kv_cache_spec,
+                    builder,
+                )
+
+            extra_attn_metadata_args = {}
+            if use_spec_decode and isinstance(builder,
+                                                GDNAttentionMetadataBuilder):
+                extra_attn_metadata_args = dict(
+                    num_accepted_tokens=self.num_accepted_tokens.
+                    gpu[:num_reqs],
+                    num_draft_tokens=self.num_draft_tokens.gpu[:num_reqs],
+                )
+
+            attn_metadata_i = builder.build(
+                common_prefix_len=common_prefix_len,
+                common_attn_metadata=common_attn_metadata,
+                **extra_attn_metadata_args)
+
+            for layer_name in attn_group.layer_names:
+                attn_metadata[layer_name] = attn_metadata_i
+
+    # Hot-Swap lora model
+    if self.lora_config:
+        self.set_active_loras(self.input_batch, num_scheduled_tokens)
+
+    return (attn_metadata, logits_indices, spec_decode_metadata,
+            num_scheduled_tokens, spec_decode_common_attn_metadata,
+            max_num_scheduled_tokens)
+
+GPUModelRunner._prepare_inputs = _prepare_inputs
+print("✅  GPUModelRunner._prepare_inputs Patched")
 
-ModelInputForGPUBuilder._compute_lens = patched_compute_lens
-print("✅  ModelInputForGPUBuilder._compute_lens Patched")
 
-
-
-# # 实现返回 hidden_states
-
-# # 1. 令 SamplerOutput 返回 hidden_states
-# from vllm.worker.model_runner import GPUModelRunnerBase
-# from vllm.inputs import INPUT_REGISTRY, InputRegistry
-# from vllm.config import VllmConfig
-# from vllm.multimodal import (MULTIMODAL_REGISTRY, MultiModalRegistry)
-
-# original_gpumodelrunnerbase = GPUModelRunnerBase.__init__
-
-# def patched_gpu_runner_init(
-#     self,
-#     vllm_config: VllmConfig,
-#     kv_cache_dtype: Optional[str] = "auto",
-#     is_driver_worker: bool = False,
-#     return_hidden_states: bool = True,
-#     input_registry: InputRegistry = INPUT_REGISTRY,
-#     mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
-# ):
-#     original_gpumodelrunnerbase(
-#         self,
-#         vllm_config=vllm_config,
-#         kv_cache_dtype=kv_cache_dtype,
-#         is_driver_worker=is_driver_worker,
-#         return_hidden_states=return_hidden_states,
-#         input_registry=input_registry,
-#         mm_registry=mm_registry,
-#     )
-
-# GPUModelRunnerBase.__init__ = patched_gpu_runner_init
-# print("✅  GPUModelRunnerBase.__init__ Patched")
-
-
-# # 2. 进一步将 hidden_states 传到 RequestOutput 中
-# from vllm.engine.async_llm_engine import _AsyncLLMEngine
-# from vllm.outputs import PoolingRequestOutput, RequestOutput
-# from vllm.sequence import ExecuteModelRequest
-# from vllm.engine.llm_engine import SchedulerOutputState
-
-# # # 为 RequestOutput 增加 hidden_states
-# # original_requestoutput = RequestOutput.__init__
-
-# # def new_init(self, *args, **kwargs):
-# #     original_requestoutput(self, *args, **kwargs)
-# #     self.hidden_states = None
-
-# # RequestOutput.__init__ = new_init
-# # print("✅  RequestOutput.__init__ Patched")
-
-# # prefill 阶段走这条路
-# async def patched_step_async(
-#         self, virtual_engine: int
-#     ) -> List[Union[RequestOutput, PoolingRequestOutput]]:
-#         """Performs one decoding iteration and returns newly generated results.
-#         The workers are ran asynchronously if possible.
-
-#         This function performs one decoding iteration of the engine. It first
-#         schedules the sequences to be executed in the next iteration and the
-#         token blocks to be swapped in/out/copy. Then, it executes the model
-#         and updates the scheduler with the model outputs. Finally, it decodes
-#         the sequences and returns the newly generated results.
-#         """
-#         # these are cached outputs from previous iterations. None if on first
-#         # iteration
-#         cached_outputs = self.cached_scheduler_outputs[virtual_engine]
-#         seq_group_metadata_list = cached_outputs.seq_group_metadata_list
-#         scheduler_outputs = cached_outputs.scheduler_outputs
-#         allow_async_output_proc = cached_outputs.allow_async_output_proc
-
-#         ctx = self.scheduler_contexts[virtual_engine]
-
-#         # Clear outputs for each new scheduler iteration
-#         ctx.request_outputs.clear()
-
-#         # skip the scheduler if there are any remaining steps in the seq groups.
-#         # This ensures that the scheduler is only called again when the current
-#         # batch has completed.
-#         if not self._has_remaining_steps(seq_group_metadata_list):
-
-#             # Schedule iteration
-#             (seq_group_metadata_list, scheduler_outputs,
-#              allow_async_output_proc
-#              ) = self.scheduler[virtual_engine].schedule()
-
-#             ctx.seq_group_metadata_list = seq_group_metadata_list
-#             ctx.scheduler_outputs = scheduler_outputs
-
-#             finished_requests_ids = self.scheduler[
-#                 virtual_engine].get_and_reset_finished_requests_ids()
-
-#             # Maybe switch from async mode to sync mode
-#             if not allow_async_output_proc and len(ctx.output_queue) > 0:
-#                 self._process_model_outputs(ctx=ctx)
-
-#             if (self.scheduler_config.is_multi_step
-#                     and scheduler_outputs.num_lookahead_slots > 0):
-#                 # cache the scheduler outputs for the next iteration if we have
-#                 # lookahead slots
-#                 self._cache_scheduler_outputs_for_multi_step(
-#                     virtual_engine, seq_group_metadata_list, scheduler_outputs,
-#                     allow_async_output_proc)
-#         else:
-#             finished_requests_ids = list()
-
-#         assert seq_group_metadata_list is not None
-#         assert scheduler_outputs is not None
-
-#         if not scheduler_outputs.is_empty():
-
-#             # Check if we have a cached last_output from the previous iteration.
-#             # For supporting PP this is probably the best way to pass the
-#             # sampled_token_ids, as a separate broadcast over all the PP stages
-#             # will cause one virtual engine's microbatch to block the pipeline.
-#             last_sampled_token_ids = \
-#                 self._get_last_sampled_token_ids(virtual_engine)
-
-#             execute_model_req = ExecuteModelRequest(
-#                 seq_group_metadata_list=seq_group_metadata_list,
-#                 blocks_to_swap_in=scheduler_outputs.blocks_to_swap_in,
-#                 blocks_to_swap_out=scheduler_outputs.blocks_to_swap_out,
-#                 blocks_to_copy=scheduler_outputs.blocks_to_copy,
-#                 virtual_engine=virtual_engine,
-#                 num_lookahead_slots=scheduler_outputs.num_lookahead_slots,
-#                 running_queue_size=scheduler_outputs.running_queue_size,
-#                 finished_requests_ids=finished_requests_ids,
-#                 # We use ExecuteModelRequest to pass the last sampled_token_ids
-#                 # to each of the non-last PP stages for in-place prepare_input.
-#                 last_sampled_token_ids=last_sampled_token_ids)
-
-#             if allow_async_output_proc:
-#                 execute_model_req.async_callback = self.async_callbacks[
-#                     virtual_engine]
-
-#             # Execute the model.
-#             outputs = await self.model_executor.execute_model_async(
-#                 execute_model_req)
-
-#             # we need to do this here so that last step's sampled_token_ids can
-#             # be passed to the next iteration for PP.
-#             if self.scheduler_config.is_multi_step:
-#                 self._update_cached_scheduler_output(virtual_engine, outputs)
-#         else:
-#             if len(ctx.output_queue) > 0:
-#                 self._process_model_outputs(ctx=ctx)
-#             outputs = []
-
-#         # Finish the current step for all the sequence groups.
-#         if self.scheduler_config.is_multi_step:
-#             for seq_group in seq_group_metadata_list:
-#                 seq_group.finish_step()
-
-#         if not self._has_remaining_steps(seq_group_metadata_list):
-#             # Clear the cache if we have finished all the steps
-#             if self.scheduler_config.is_multi_step:
-#                 self.cached_scheduler_outputs[
-#                     virtual_engine] = SchedulerOutputState()
-
-#             # is_first_step_output is True only when the num_steps of all
-#             # the sequences are 1. When the num_steps > 1,
-#             # multi_step_model_runner does the first-step output append.
-#             is_first_step_output: bool = False if not seq_group_metadata_list \
-#                 else seq_group_metadata_list[0].state.num_steps == 1
-
-#             ctx.append_output(outputs=outputs,
-#                               seq_group_metadata_list=seq_group_metadata_list,
-#                               scheduler_outputs=scheduler_outputs,
-#                               is_async=allow_async_output_proc,
-#                               is_last_step=True,
-#                               is_first_step_output=is_first_step_output)
-
-#             if outputs and allow_async_output_proc:
-#                 assert len(
-#                     outputs
-#                 ) == 1, "Async postprocessor expects only a single output set"
-#                 self._advance_to_next_step(
-#                     outputs[0], seq_group_metadata_list,
-#                     scheduler_outputs.scheduled_seq_groups)
-            
-#             if not allow_async_output_proc:
-#                 self._process_model_outputs(ctx=ctx)
-
-#                 # Log stats.
-#                 self.do_log_stats(scheduler_outputs, outputs)
-
-#                 # Tracing
-#                 self.do_tracing(scheduler_outputs)
-
-#         else:
-#             # Multi-step case
-#             return ctx.request_outputs
-
-#         if not self.has_unfinished_requests():
-#             # Drain async postprocessor (if exists)
-#             if len(ctx.output_queue) > 0:
-#                 self._process_model_outputs(ctx=ctx)
-#             assert len(ctx.output_queue) == 0
-        
-#         # print("step_async outputs", outputs)
-#         for idx in range(len(ctx.request_outputs)):
-#             ctx.request_outputs[idx].hidden_states = outputs[0].hidden_states[idx: idx+1]
-#         return ctx.request_outputs
-
-# _AsyncLLMEngine.step_async = patched_step_async
-# print("✅  _AsyncLLMEngine.step_async Patched")
-
-
-# # decode 阶段会走这条路
-# from vllm.engine.llm_engine import LLMEngine, SchedulerContext
-# from vllm.sequence import (SequenceGroup, SequenceGroupOutput)
-# from vllm.engine.output_processor.util import create_output_by_sequence_group
-# from vllm.model_executor.layers.sampler import SamplerOutput
-# from vllm.outputs import RequestOutputFactory
-# from vllm.sampling_params import RequestOutputKind
-
-# def patched_process_model_outputs(self,
-#                             ctx: SchedulerContext,
-#                             request_id: Optional[str] = None) -> None:
-#         """Apply the model output to the sequences in the scheduled seq groups
-#         and return responses.
-
-#         ctx: The virtual engine context to work on
-#         request_id: If provided, then only this request is going to be processed
-#         """
-
-#         now = time.time()
-
-#         if len(ctx.output_queue) == 0:
-#             return None
-
-#         # Get pending async postprocessor
-#         if request_id:
-#             # When we process only one request, no pop is required
-#             # (since later we will process all of the rest)
-#             (outputs, seq_group_metadata_list, scheduler_outputs, is_async,
-#              is_last_step, is_first_step_output, skip) = ctx.output_queue[0]
-#         else:
-#             (outputs, seq_group_metadata_list, scheduler_outputs, is_async,
-#              is_last_step, is_first_step_output,
-#              skip) = ctx.output_queue.popleft()
-
-#         # Sanity check
-#         assert len(seq_group_metadata_list) == len(
-#             scheduler_outputs.scheduled_seq_groups)
-
-#         has_multiple_outputs: bool = len(outputs) > 1
-#         outputs_by_sequence_group: List[List[SequenceGroupOutput]]
-#         if has_multiple_outputs:
-#             assert self.scheduler_config.is_multi_step or \
-#                      self.speculative_config
-#             # Organize outputs by [step][sequence group] instead of
-#             # [sequence group][step].
-#             if self.scheduler_config.is_multi_step:
-#                 outputs_by_sequence_group = create_output_by_sequence_group(
-#                     outputs, len(seq_group_metadata_list))
-#             elif self.speculative_config:
-#                 # Decodes are multi-steps while prefills are not, outputting at
-#                 # most 1 token. Separate them so that we can trigger chunk
-#                 # processing without having to pad or copy over prompts K times
-#                 # to match decodes structure (costly with prompt_logprobs).
-#                 num_prefills = sum(sg.is_prompt
-#                                    for sg in seq_group_metadata_list)
-#                 prefills, decodes = outputs[:num_prefills], outputs[
-#                     num_prefills:]
-#                 outputs_by_sequence_group = create_output_by_sequence_group(
-#                     decodes,
-#                     num_seq_groups=len(seq_group_metadata_list) - num_prefills)
-#                 outputs_by_sequence_group = [p.outputs for p in prefills
-#                                              ] + outputs_by_sequence_group
-#             # We have outputs for multiple steps submitted in a single burst,
-#             # so invalidate is_first_step_output.
-#             is_first_step_output = None
-#         else:
-#             outputs_by_sequence_group = outputs
-
-#         # Determine the requests we need to operate on
-#         if request_id:
-#             indices = []
-#             for i, seq_group_meta in enumerate(seq_group_metadata_list):
-#                 if seq_group_meta.request_id == request_id:
-#                     assert i not in skip  # Cannot be called twice
-#                     indices.append(i)
-#                     break
-
-#             # If the request_id was not found, then it means that
-#             # this is a new request that has no pending async
-#             # postprocessor
-#             if not indices:
-#                 return
-#         else:
-#             indices = range(len(seq_group_metadata_list))  # type: ignore
-
-#         finished_before: List[int] = []
-#         finished_now: List[int] = []
-#         for i in indices:
-#             if i in skip:
-#                 continue
-
-#             seq_group_meta = seq_group_metadata_list[i]
-#             scheduled_seq_group = scheduler_outputs.scheduled_seq_groups[i]
-
-#             seq_group: SequenceGroup = scheduled_seq_group.seq_group
-
-#             if seq_group.is_finished():
-#                 finished_before.append(i)
-#                 continue
-
-#             output: List[SequenceGroupOutput]
-#             if has_multiple_outputs:
-#                 output = outputs_by_sequence_group[i]
-#             else:
-#                 output = [outputs_by_sequence_group[0][i]]
-
-#             if not is_async:
-#                 if self.scheduler_config.is_multi_step:
-#                     # Updates happen only if the sequence is prefill
-#                     self._update_num_computed_tokens_for_multi_step_prefill(
-#                         seq_group, seq_group_meta, is_first_step_output)
-#                 else:
-#                     seq_group.update_num_computed_tokens(
-#                         seq_group_meta.token_chunk_size or 0)
-
-#             if outputs:
-#                 for o in outputs:
-#                     if (isinstance(o, SamplerOutput)
-#                             and seq_group.metrics is not None):
-#                         if seq_group.metrics.model_forward_time is not None:
-#                             seq_group.metrics.model_forward_time += (
-#                                 o.model_forward_time or 0)
-#                         else:
-#                             seq_group.metrics.model_forward_time = (
-#                                 o.model_forward_time)
-#                         if seq_group.metrics.model_execute_time is not None:
-#                             seq_group.metrics.model_execute_time += (
-#                                 o.model_execute_time or 0)
-#                         else:
-#                             seq_group.metrics.model_execute_time = (
-#                                 o.model_execute_time)
-
-#             if self.model_config.runner_type == "pooling":
-#                 self._process_sequence_group_outputs(seq_group, output)
-#             else:
-#                 self.output_processor.process_prompt_logprob(seq_group, output)
-#                 if seq_group_meta.do_sample:
-#                     self.output_processor.process_outputs(
-#                         seq_group, output, is_async)
-
-#             if seq_group.is_finished():
-#                 finished_now.append(i)
-
-#         # Generate outputs for the requests that finished this iteration
-#         # print("process_model_outputs1 outputs", len(outputs), [hs.shape for hs in outputs[0].hidden_states])
-#         for i in finished_now:
-#             scheduled_seq_group = scheduler_outputs.scheduled_seq_groups[i]
-
-#             seq_group = scheduled_seq_group.seq_group
-#             seq_group.maybe_set_first_token_time(now)
-#             if not seq_group.is_prefill():
-#                 seq_group.set_last_token_time(now)
-#             request_output = RequestOutputFactory.create(
-#                 seq_group,
-#                 self.seq_id_to_seq_group,
-#                 use_cache=self.use_cached_outputs)
-#             if request_output:
-#                 request_output.hidden_states = outputs[0].hidden_states[i: i+1]
-#                 ctx.request_outputs.append(request_output)
-
-#         # When we process a single request, we skip it for the next time,
-#         # and invoke the request output callback (if there was final output)
-#         if request_id:
-#             assert len(indices) == 1
-#             skip.append(indices[0])
-
-#             if (finished_now
-#                     and self.process_request_outputs_callback is not None):
-#                 self.process_request_outputs_callback(ctx.request_outputs)
-#                 ctx.request_outputs.clear()
-#             return
-
-#         # Free currently finished requests
-#         if finished_now:
-#             for scheduler in self.scheduler:
-#                 scheduler.free_finished_seq_groups()
-
-#         # For multi-step without streaming, don't create outputs each iteration
-#         if not is_last_step and not ctx.multi_step_stream_outputs:
-#             # Immediately process request outputs here (if callback is given)
-#             if (finished_now
-#                     and self.process_request_outputs_callback is not None):
-#                 self.process_request_outputs_callback(ctx.request_outputs)
-#                 ctx.request_outputs.clear()
-#             return
-
-#         # Create the outputs
-#         # print("process_model_outputs2 outputs", len(outputs), [hs.shape for hs in outputs[0].hidden_states])
-#         for i in indices:
-#             if i in skip or i in finished_before or i in finished_now:
-#                 continue  # Avoids double processing
-
-#             scheduled_seq_group = scheduler_outputs.scheduled_seq_groups[i]
-
-#             seq_group = scheduled_seq_group.seq_group
-#             seq_group.maybe_set_first_token_time(now)
-#             if not seq_group.is_prefill():
-#                 seq_group.set_last_token_time(now)
-#             request_output = RequestOutputFactory.create(
-#                 seq_group,
-#                 self.seq_id_to_seq_group,
-#                 use_cache=self.use_cached_outputs)
-#             if request_output:
-#                 request_output.hidden_states = outputs[0].hidden_states[i: i+1]
-#                 ctx.request_outputs.append(request_output)
-
-#         # For multi-step with streaming, create outputs each iteration
-#         if not is_last_step and ctx.multi_step_stream_outputs:
-#             # Immediately process request outputs here (if callback is given)
-#             if self.process_request_outputs_callback is not None:
-#                 self.process_request_outputs_callback(ctx.request_outputs)
-#                 ctx.request_outputs.clear()
-#             return
-
-#         for seq_group in scheduler_outputs.ignored_seq_groups:
-#             params = seq_group.sampling_params
-#             if params is not None and params.output_kind == (
-#                     RequestOutputKind.DELTA) and not seq_group.is_finished():
-#                 continue
-
-#             request_output = RequestOutputFactory.create(
-#                 seq_group,
-#                 self.seq_id_to_seq_group,
-#                 use_cache=self.use_cached_outputs,
-#             )
-#             if request_output:
-#                 ctx.request_outputs.append(request_output)
-
-#         # Immediately process request outputs here (if callback is given)
-#         if (ctx.request_outputs
-#                 and self.process_request_outputs_callback is not None):
-#             self.process_request_outputs_callback(ctx.request_outputs)
-#             ctx.request_outputs.clear()
-
-#         # For async case, we need to record the stats here.
-#         # For non-async case, the stats are done in the
-#         # LLMEngine/AsyncLLMEngine directly
-#         if is_async:
-#             # Log stats.
-#             self.do_log_stats(scheduler_outputs, outputs, finished_before,
-#                               skip)
-
-#             # Tracing
-#             self.do_tracing(scheduler_outputs, finished_before)
-
-#         return None
-
-# LLMEngine._process_model_outputs = patched_process_model_outputs
-# print("✅  LLMEngine._process_model_outputs Patched")

@@ -65,7 +65,7 @@ def trim_and_pad_silence(wav_data, threshold=1000, min_silence=int(24000*0.4)):
 
 class IndexTTS:
     def __init__(
-        self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", gpu_memory_utilization=0.25, is_fp16=True, device=None, use_cuda_kernel=None,
+        self, vllm_model, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", is_fp16=True, device=None, use_cuda_kernel=None,
     ):
         """
         Args:
@@ -98,7 +98,7 @@ class IndexTTS:
         self.dtype = torch.float16 if self.is_fp16 else None
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
 
-        self.gpt = UnifiedVoice(gpu_memory_utilization, **self.cfg.gpt, model_dir=model_dir)
+        self.gpt = UnifiedVoice(vllm_model, **self.cfg.gpt, model_dir=model_dir)
         self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
         load_checkpoint(self.gpt, self.gpt_path)
         self.gpt = self.gpt.to(self.device)
