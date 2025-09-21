@@ -6,6 +6,7 @@
 </div>
 
 Working on IndexTTS2 support, coming soon... 0.0
+- [2025-09-22] Added support for vLLM v1, but errors may occur under high concurrency. It is recommended to use IndexTTS-vLLM-1.0 Releases for now. IndexTTS2 compatibility is still in progress.
 
 ## Introduction
 This project reimplements the inference of the GPT model from [index-tts](https://github.com/index-tts/index-tts) using the vllm library, accelerating the inference process of index-tts.
