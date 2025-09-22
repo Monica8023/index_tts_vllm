@@ -23,6 +23,12 @@ if ! wget https://modelscope.cn/models/openai-community/gpt2/resolve/master/toke
     exit 1
 fi
 
+if ! wget https://modelscope.cn/models/Qwen/Qwen2-Audio-7B-Instruct/resolve/master/preprocessor_config.json -O "$VLLM_DIR/preprocessor_config.json"; then
+    echo "Error: Failed to download tokenizer_config.json"
+    exit 1
+fi
+
+
 echo "Converting model format..."
 if ! python convert_hf_format.py --model_dir "$MODEL_DIR"; then
     echo "Error: Model conversion failed"
