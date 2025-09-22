@@ -99,7 +99,7 @@ python webui.py
 使用 fastapi 封装了 api 接口，启动示例如下，请将 `--model_dir` 改为你的模型的实际路径：
 
 ```bash
-python api_server.py model_dir /your/path/to/Index-TTS
+python api_server.py --model_dir /your/path/to/Index-TTS
 ```
 
 ### 启动参数
