@@ -15,7 +15,7 @@ ModelRegistry.register_model("GPT2InferenceModel", GPT2TTSModel)
 print("✅  Registry GPT2TTSModel to vllm")
 
 
-# 将 position_ids 减去 prefill 的长度再加 1，以便计算每一步 decode 的 position embed
+# 将 position_ids 减去 prefill 的长度再加 1，以便正确计算每一步 decode 的 position embedding
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 import numpy as np
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -91,7 +91,7 @@ def _prepare_inputs(
     self.input_batch.block_table.commit_slot_mapping(
         total_num_scheduled_tokens)
 
-    # GPT2TTSModel 修改位置编码
+    # GPT2TTSModel position ids support
     model = self.get_model()
     if isinstance(model, GPT2TTSModel):
         # req_ids_in_batch = self.input_batch.req_ids[:num_reqs]

@@ -216,7 +216,7 @@ class IndexTTS:
                     self.gpt.sampling_params.seed = int(seed)
                 else:
                     self.gpt.sampling_params.seed = None
-                codes, latent = await self.gpt.inference_speech(
+                codes = await self.gpt.inference_speech(
                     speech_conditioning_latent,
                     text_tokens,
                     # cond_mel_lengths=torch.tensor([auto_conditioning.shape[-1]], device=text_tokens.device)
