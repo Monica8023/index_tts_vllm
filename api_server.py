@@ -25,20 +25,7 @@ tts = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global tts
-    cfg_path = os.path.join(args.model_dir, "config.yaml")
-    from vllm.engine.arg_utils import AsyncEngineArgs
-    from vllm.v1.engine.async_llm import AsyncLLM
-
-    vllm_dir = os.path.join(args.model_dir, "vllm")
-    engine_args = AsyncEngineArgs(
-        model=vllm_dir,
-        tensor_parallel_size=1,
-        dtype="auto",
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        # enforce_eager=True,
-    )
-    indextts_vllm = AsyncLLM.from_engine_args(engine_args)
-    tts = IndexTTS(model_dir=args.model_dir, vllm_model=indextts_vllm, cfg_path=cfg_path)
+    tts = IndexTTS(model_dir=args.model_dir, gpu_memory_utilization=args.gpu_memory_utilization)
 
     current_file_path = os.path.abspath(__file__)
     cur_dir = os.path.dirname(current_file_path)

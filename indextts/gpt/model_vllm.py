@@ -6,7 +6,7 @@ import patch_vllm  # ⚠️ Monkey Patch, do not delete this line
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import GPT2Config, GPT2LMHeadModel, LogitsProcessorList
+from transformers import AutoModelForCausalLM, GPT2Config, GPT2LMHeadModel, LogitsProcessorList
 
 from transformers import GPT2Config, GPT2Model
 
@@ -106,12 +106,18 @@ class UnifiedVoice(nn.Module):
                                 gradient_checkpointing=False,
                                 use_cache=True)
         self.gpt = GPT2Model(gpt_config)
-        self.gpt = self.gpt.eval()
-        # Override the built in positional embeddings
+        # self.gpt = AutoModelForCausalLM.from_pretrained(
+        #     os.path.join(model_dir, "vllm"),
+        #     # torch_dtype=torch.float16,
+        #     # device_map="auto",
+        #     # trust_remote_code=True,          # 若自定义模型类需打开
+        # ).transformer
         del self.gpt.wpe
         self.gpt.wpe = functools.partial(null_position_embeddings, dim=model_dim)
-        # Built-in token embeddings are unused.
         del self.gpt.wte
+        # self.gpt = self.gpt.to("cuda")  # .to(torch.float16)
+        # self.gpt.eval()
+
         self.mel_pos_embedding, self.text_pos_embedding  = LearnedPositionEmbeddings(max_mel_seq_len, model_dim), LearnedPositionEmbeddings(max_text_seq_len, model_dim)
 
         self.mel_solo_embedding = 0

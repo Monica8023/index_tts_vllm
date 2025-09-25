@@ -371,6 +371,8 @@ class GPT2TTSModel(nn.Module, SupportsPP, SupportsMultiModal):
         for name, loaded_weight in weights:
             if ".attn.bias" in name or ".attn.masked_bias" in name:
                 continue
+            if ".wte" in name:
+                continue
             if is_pp_missing_parameter(name, self):
                 continue
             param = params_dict[name]
@@ -382,7 +384,11 @@ class GPT2TTSModel(nn.Module, SupportsPP, SupportsMultiModal):
                 loaded_weight = loaded_weight.t()
             weight_loader = getattr(param, "weight_loader",
                                     default_weight_loader)
+            # try:
             weight_loader(param, loaded_weight)
+            # except:
+            #     print("weight_loader", name)
+            #     raise AssertionError()
             loaded_params.add(name)
         
         # 确保在加载权重后，第0个位置的embedding仍然是全零向量。

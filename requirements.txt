@@ -5,6 +5,8 @@ sentencepiece
 librosa
 gradio
 ninja
+modelscope
+munch==4.0.0
 
 WeTextProcessing; platform_machine != "Darwin"
 wetext; platform_system == "Darwin"

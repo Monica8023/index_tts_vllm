@@ -119,7 +119,6 @@ class UnifiedVoice(nn.Module):
                                 gradient_checkpointing=False,
                                 use_cache=True)
         self.gpt = GPT2Model(gpt_config)
-        self.gpt = self.gpt.eval()
         # Override the built in positional embeddings
         del self.gpt.wpe
         self.gpt.wpe = functools.partial(null_position_embeddings, dim=model_dim)

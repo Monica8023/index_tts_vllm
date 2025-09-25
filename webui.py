@@ -18,38 +18,25 @@ from indextts.infer_vllm import IndexTTS
 model_dir = "/root/autodl-fs/index-tts"
 gpu_memory_utilization = 0.25
 
-cfg_path = os.path.join(model_dir, "config.yaml")
+
+async def gen_single(prompts, text, progress=gr.Progress()):
+    output_path = None
+    tts.gr_progress = progress
+    
+    if isinstance(prompts, list):
+        prompt_paths = [prompt.name for prompt in prompts if prompt is not None]
+    else:
+        prompt_paths = [prompts.name] if prompts is not None else []
+    
+    output = await tts.infer(prompt_paths, text, output_path, verbose=True)
+    return gr.update(value=output, visible=True)
+
+def update_prompt_audio():
+    return gr.update(interactive=True)
+
 
 if __name__ == "__main__":
-    from vllm.engine.arg_utils import AsyncEngineArgs
-    from vllm.v1.engine.async_llm import AsyncLLM
-
-    vllm_dir = os.path.join(model_dir, "vllm")
-    engine_args = AsyncEngineArgs(
-        model=vllm_dir,
-        tensor_parallel_size=1,
-        dtype="auto",
-        gpu_memory_utilization=gpu_memory_utilization,
-        # enforce_eager=True,
-    )
-    indextts_vllm = AsyncLLM.from_engine_args(engine_args)
-    tts = IndexTTS(model_dir=model_dir, vllm_model=indextts_vllm, cfg_path=cfg_path)
-
-
-    async def gen_single(prompts, text, progress=gr.Progress()):
-        output_path = None
-        tts.gr_progress = progress
-        
-        if isinstance(prompts, list):
-            prompt_paths = [prompt.name for prompt in prompts if prompt is not None]
-        else:
-            prompt_paths = [prompts.name] if prompts is not None else []
-        
-        output = await tts.infer(prompt_paths, text, output_path, verbose=True)
-        return gr.update(value=output, visible=True)
-
-    def update_prompt_audio():
-        return gr.update(interactive=True)
+    tts = IndexTTS(model_dir=model_dir, gpu_memory_utilization=gpu_memory_utilization)
 
     with gr.Blocks() as demo:
         mutex = threading.Lock()
