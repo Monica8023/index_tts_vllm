@@ -92,7 +92,7 @@ with open("examples/cases.jsonl", "r", encoding="utf-8") as f:
                             )
 
 
-def gen_single(emo_control_method,prompt, text,
+async def gen_single(emo_control_method,prompt, text,
             emo_ref_path, emo_weight,
             vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
             emo_text,emo_random,
@@ -102,7 +102,7 @@ def gen_single(emo_control_method,prompt, text,
     if not output_path:
         output_path = os.path.join("outputs", f"spk_{int(time.time())}.wav")
     # set gradio progress
-    tts.gr_progress = progress
+    # tts.gr_progress = progress
     do_sample, top_p, top_k, temperature, \
         length_penalty, num_beams, repetition_penalty, max_mel_tokens = args
     kwargs = {
@@ -134,7 +134,7 @@ def gen_single(emo_control_method,prompt, text,
         vec = None
 
     print(f"Emo control mode:{emo_control_method},vec:{vec}")
-    output = tts.infer(spk_audio_prompt=prompt, text=text,
+    output = await tts.infer(spk_audio_prompt=prompt, text=text,
                     output_path=output_path,
                     emo_audio_prompt=emo_ref_path, emo_alpha=emo_weight,
                     emo_vector=vec,
@@ -171,7 +171,7 @@ if __name__ == "__main__":
                 if prompt_list:
                     default = prompt_list[0]
                 with gr.Column():
-                    input_text_single = gr.TextArea(label=i18n("文本"),key="input_text_single", placeholder=i18n("请输入目标文本"), info=f"{i18n('当前模型版本')}{tts.model_version or '1.0'}")
+                    input_text_single = gr.TextArea(label=i18n("文本"),key="input_text_single", placeholder=i18n("请输入目标文本"), info=f"{i18n('当前模型版本')}{'2.0' or '1.0'}")
                     gen_button = gr.Button(i18n("生成语音"), key="gen_button",interactive=True)
                 output_audio = gr.Audio(label=i18n("生成结果"), visible=True,key="output_audio")
             with gr.Accordion(i18n("功能设置")):

@@ -197,7 +197,7 @@ class UnifiedVoice(nn.Module):
         conds = self.emo_perceiver_encoder(speech_conditioning_input, conds_mask)  # (b, 1, d)
         return conds.squeeze(1)
 
-    async def inference_speech(self, speech_conditioning_latent, text_inputs, emo_speech_condition=None, cond_lengths=None, emo_cond_lengths=None, emo_vec=None, use_speed=False):
+    async def inference_speech(self, speech_condition, text_inputs, emo_speech_condition=None, cond_lengths=None, emo_cond_lengths=None, emo_vec=None, use_speed=False):
         if speech_condition.ndim == 2:
             speech_condition = speech_condition.unsqueeze(0)
         if emo_speech_condition is None:
@@ -240,6 +240,7 @@ class UnifiedVoice(nn.Module):
             # latent.append(output.hidden_states.clone())
             pass
         codes = output.outputs[0].token_ids[:-2]
+        codes = torch.tensor(codes, device=text_inputs.device, dtype=torch.long).unsqueeze(0)
 
         return codes, speech_conditioning_latent
 

@@ -102,7 +102,7 @@ class IndexTTS:
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.v1.engine.async_llm import AsyncLLM
 
-        vllm_dir = os.path.join(model_dir, "vllm")
+        vllm_dir = os.path.join(model_dir, "gpt")
         engine_args = AsyncEngineArgs(
             model=vllm_dir,
             tensor_parallel_size=1,

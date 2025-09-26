@@ -107,7 +107,7 @@ class UnifiedVoice(nn.Module):
                                 use_cache=True)
         self.gpt = GPT2Model(gpt_config)
         # self.gpt = AutoModelForCausalLM.from_pretrained(
-        #     os.path.join(model_dir, "vllm"),
+        #     os.path.join(model_dir, "gpt"),
         #     # torch_dtype=torch.float16,
         #     # device_map="auto",
         #     # trust_remote_code=True,          # 若自定义模型类需打开

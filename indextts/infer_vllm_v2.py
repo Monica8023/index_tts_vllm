@@ -128,7 +128,9 @@ class IndexTTS2:
         self.semantic_std = self.semantic_std.to(self.device)
 
         semantic_codec = build_semantic_codec(self.cfg.semantic_codec)
-        semantic_code_ckpt = hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors", cache_dir=os.path.join(self.model_dir, "semantic_codec"))
+        # semantic_code_ckpt = hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors", cache_dir=os.path.join(self.model_dir, "semantic_codec"))
+        semantic_code_ckpt = os.path.join(self.model_dir, "semantic_codec/model.safetensors")
+        # print("semantic_code_ckpt", semantic_code_ckpt)
         safetensors.torch.load_model(semantic_codec, semantic_code_ckpt)
         self.semantic_codec = semantic_codec.to(self.device)
         self.semantic_codec.eval()
@@ -151,8 +153,9 @@ class IndexTTS2:
 
         # load campplus_model
         campplus_ckpt_path = hf_hub_download(
-            "funasr/campplus", filename="campplus_cn_common.bin"
+            "funasr/campplus", filename="campplus_cn_common.bin", cache_dir=os.path.join(self.model_dir, "campplus")
         )
+        # campplus_ckpt_path = os.path.join(self.model_dir, )
         campplus_model = CAMPPlus(feat_dim=80, embedding_size=192)
         campplus_model.load_state_dict(torch.load(campplus_ckpt_path, map_location="cpu"))
         self.campplus_model = campplus_model.to(self.device)
@@ -160,7 +163,7 @@ class IndexTTS2:
         print(">> campplus_model weights restored from:", campplus_ckpt_path)
 
         bigvgan_name = self.cfg.vocoder.name
-        self.bigvgan = bigvgan.BigVGAN.from_pretrained(bigvgan_name, use_cuda_kernel=False)
+        self.bigvgan = bigvgan.BigVGAN.from_pretrained(bigvgan_name, use_cuda_kernel=False, cache_dir=os.path.join(self.model_dir, "bigvgan"))
         self.bigvgan = self.bigvgan.to(self.device)
         self.bigvgan.remove_weight_norm()
         self.bigvgan.eval()
@@ -386,6 +389,7 @@ class IndexTTS2:
                     emo_cond_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
                     emo_vec=emovec,
                 )
+                # print("codes: ", codes)
                 gpt_gen_time += time.perf_counter() - m_start_time
                 if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
                     warnings.warn(
