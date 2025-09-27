@@ -23,7 +23,7 @@
     - 对应：[createSpeech](https://platform.openai.com/docs/api-reference/audio/createSpeech)
 
 - **[2025-09-22]** 支持了 vllm v1 版本，IndexTTS2 正在兼容中
-- **[2025-09-28]** 支持了 IndexTTS2 的 webui 推理，并整理了权重文件，现在部署更加方便了 0.0 ；但当前版本对于 IndexTTS2 的 gpt 似乎并没有加速效果，待研究
+- **[2025-09-28]** 支持了 IndexTTS2 的 webui 推理，并整理了权重文件，现在部署更加方便了！ \0.0/ ；但当前版本对于 IndexTTS2 的 gpt 似乎并没有加速效果，待研究（国庆再抽空研究了）
 
 ## 使用步骤
 
