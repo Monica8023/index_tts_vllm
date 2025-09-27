@@ -1,6 +1,8 @@
 import os
 from omegaconf import OmegaConf
-from indextts.gpt.model import UnifiedVoice
+import torch
+# from indextts.gpt.model import UnifiedVoice
+from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.utils.checkpoint import load_checkpoint
 import argparse
 
@@ -16,7 +18,7 @@ cfg = OmegaConf.load(cfg_path)
 gpt = UnifiedVoice(**cfg.gpt)
 gpt_path = os.path.join(model_dir, cfg.gpt_checkpoint)
 load_checkpoint(gpt, gpt_path)
-gpt = gpt.to("cuda")
+gpt = gpt.to(device="cuda", dtype=torch.float16)
 gpt.eval()  # .half()
 gpt.post_init_gpt2_config()
 print(">> GPT weights restored from:", gpt_path)

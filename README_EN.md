@@ -5,49 +5,34 @@
 # IndexTTS-vLLM
 </div>
 
-Working on IndexTTS2 support, coming soon... 0.0
-
-## Project Introduction
-This project reimplements the inference of the GPT model using the vllm library, based on [index-tts](https://github.com/index-tts/index-tts), to accelerate the inference process of index-tts.
+## Introduction
+This project re-implements the inference of the gpt model from [index-tts](https://github.com/index-tts/index-tts) using the vllm library, which accelerates the inference process of index-tts.
 
 The inference speed improvement on a single RTX 4090 is as follows:
 - RTF (Real-Time Factor) for a single request: ≈0.3 -> ≈0.1
-- GPT model decode speed for a single request: ≈90 token/s -> ≈280 token/s
-- Concurrency: With `gpu_memory_utilization` set to 0.25 (about 5GB of GPU memory), it was tested to handle a concurrency of around 16 without pressure (see `simple_test.py` for the benchmarking script).
-
-## New Features
-- Supports multi-role audio mixing: You can input multiple reference audios, and the TTS output's voice will be a mixed version of the reference audios (inputting multiple reference audios may cause the output voice to be unstable; you can try generating until you get a satisfactory voice to use as a reference audio).
-
-## Performance
-Word Error Rate (WER) Results for IndexTTS and Baseline Models on the [**seed-test**](https://github.com/BytedanceSpeech/seed-tts-eval)
-
-| model | zh | en |
-|---|---|---|
-| Human | 1.254 | 2.143 |
-| index-tts (num_beams=3) | 1.005 | 1.943 |
-| index-tts (num_beams=1) | 1.107 | 2.032 |
-| index-tts-vllm | 1.12 | 1.987 |
-
-It basically maintains the performance of the original project.
+- gpt model decode speed for a single request: ≈90 token / s -> ≈280 token / s
+- Concurrency: With gpu_memory_utilization set to 0.25 (approximately 5GB of VRAM), it has been tested to handle a concurrency of around 16 without issues (for the testing script, refer to `simple_test.py`).
 
 ## Update Log
 
-- **[2025-08-07]** Added support for fully automated one-click API service deployment with Docker: `docker compose up`
+- **[2025-08-07]** Support for fully automated one-click deployment of the API service using Docker: `docker compose up`
 
-- **[2025-08-06]** Added support for OpenAI API format calls:
-    1. Added `/audio/speech` API path for OpenAI compatibility.
-    2. Added `/audio/voices` API path to get the list of voices/characters.
+- **[2025-08-06]** Support for calling in the OpenAI interface format:
+    1. Added `/audio/speech` api path to be compatible with the OpenAI interface.
+    2. Added `/audio/voices` api path to get the voice/character list.
     - Corresponds to: [createSpeech](https://platform.openai.com/docs/api-reference/audio/createSpeech)
 
-- **[2025-09-22]** Added support for vllm v1, IndexTTS2 compatibility is in progress.
+- **[2025-09-22]** vllm v1 is now supported, and compatibility with IndexTTS2 is in progress.
+- **[2025-09-28]** Webui inference for IndexTTS2 is now supported, and the weight files have been organized for more convenient deployment 0.0; however, the current version does not seem to have an accelerating effect on the gpt of IndexTTS2, which is under investigation.
 
 ## Usage Steps
 
-### 1. Clone this project
+### 1. git clone this project
 ```bash
 git clone https://github.com/Ksuriuri/index-tts-vllm.git
 cd index-tts-vllm
 ```
+
 
 ### 2. Create and activate a conda environment
 ```bash
@@ -55,63 +40,93 @@ conda create -n index-tts-vllm python=3.12
 conda activate index-tts-vllm
 ```
 
-### 3. Install PyTorch
 
-Requires PyTorch version 2.8.0 (corresponding to vllm 0.10.2). For specific installation instructions, please refer to the [PyTorch official website](https://pytorch.org/get-started/locally/).
+### 3. Install pytorch
+
+Pytorch version 2.8.0 is required (corresponding to vllm 0.10.2). For specific installation instructions, please refer to the [pytorch official website](https://pytorch.org/get-started/locally/).
+
 
 ### 4. Install dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
+
 ### 5. Download model weights
 
-These are the official weight files. Download them to any local path. Supports IndexTTS-1.5 weights.
+(Recommended) Download the model weights for the corresponding version to the `checkpoints/` path:
 
-| **HuggingFace** | **ModelScope** |
-|---|---|
-| [IndexTTS](https://huggingface.co/IndexTeam/Index-TTS) | [IndexTTS](https://modelscope.cn/models/IndexTeam/Index-TTS) |
-| [😁IndexTTS-1.5](https://huggingface.co/IndexTeam/IndexTTS-1.5) | [IndexTTS-1.5](https://modelscope.cn/models/IndexTeam/IndexTTS-1.5) |
+```bash
+# Index-TTS
+modelscope download --model kusuriuri/Index-TTS-vLLM --local_dir ./checkpoints/Index-TTS-vLLM
 
-### 6. Convert model weights
+# IndexTTS-1.5
+modelscope download --model kusuriuri/Index-TTS-1.5-vLLM --local_dir ./checkpoints/Index-TTS-1.5-vLLM
+
+# IndexTTS-2
+modelscope download --model kusuriuri/IndexTTS-2-vLLM --local_dir ./checkpoints/IndexTTS-2-vLLM
+```
+
+(Optional, not recommended) You can also use `convert_hf_format.sh` to convert the official weight files yourself:
 
 ```bash
 bash convert_hf_format.sh /path/to/your/model_dir
 ```
 
-This operation will convert the official model weights to a format compatible with the transformers library, saved in the `vllm` folder under the model weight path, for easy loading by the vllm library.
+### 6. Start the webui!
 
-### 7. Launch the web UI!
-Modify the `model_dir` in [`webui.py`](webui.py) to your model weight download path, then run:
+Run the corresponding version:
 
 ```bash
+# Index-TTS 1.0
 python webui.py
-```
 
-The first launch might take longer as it needs to compile CUDA kernels for bigvgan.
+# IndexTTS-1.5
+python webui.py --version 1.5
+
+# IndexTTS-2
+python webui_v2.py
+```
+The first startup may take longer because it needs to compile the cuda kernel for bigvgan.
+
 
 ## API
 
-An API is encapsulated using FastAPI. Here is an example to start it. Please change `--model_dir` to the actual path of your model:
+The api interface is encapsulated using fastapi. The following is an example of how to start it. Please change `--model_dir` to the actual path of your model:
 
 ```bash
 python api_server.py --model_dir /your/path/to/Index-TTS
 ```
 
-### Startup Parameters
-- `--model_dir`: Required, path to the model weights.
-- `--host`: Service IP address, defaults to `0.0.0.0`.
-- `--port`: Service port, defaults to `6006`.
-- `--gpu_memory_utilization`: VLLM GPU memory utilization rate, defaults to `0.25`.
+### Startup parameters
+- `--model_dir`: Required, the path to the model weights.
+- `--host`: Service ip address, defaults to `6006`.
+- `--port`: Service port, defaults to `0.0.0.0`.
+- `--gpu_memory_utilization`: vllm GPU memory utilization, defaults to `0.25`.
 
-### Request Example
+### Request example
 Refer to `api_example.py`.
 
 ### OpenAI API
-- Added `/audio/speech` API path for OpenAI compatibility.
-- Added `/audio/voices` API path to get the list of voices/characters.
+- Added `/audio/speech` api path to be compatible with the OpenAI interface.
+- Added `/audio/voices` api path to get the voice/character list.
 
 For details, see: [createSpeech](https://platform.openai.com/docs/api-reference/audio/createSpeech)
 
+## New Features
+- **v1/v1.5:** Supports multi-character audio mixing: You can pass in multiple reference audios, and the TTS output character's voice will be a mixed version of the multiple reference audios (inputting multiple reference audios may cause the output character's voice to be unstable, you can "reroll" until you get a satisfactory voice and then use it as a reference audio).
+
+## Performance
+Word Error Rate (WER) Results for IndexTTS and Baseline Models on the [**seed-test**](https://github.com/BytedanceSpeech/seed-tts-eval)
+
+| model                   | zh    | en    |
+| ----------------------- | ----- | ----- |
+| Human                   | 1.254 | 2.143 |
+| index-tts (num_beams=3) | 1.005 | 1.943 |
+| index-tts (num_beams=1) | 1.107 | 2.032 |
+| index-tts-vllm      | 1.12  | 1.987 |
+
+The performance of the original project is basically maintained.
+
 ## Concurrency Test
-Refer to [`simple_test.py`](simple_test.py). The API service needs to be started first.
+Refer to [`simple_test.py`](simple_test.py), the API service needs to be started first.
