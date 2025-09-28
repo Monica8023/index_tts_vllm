@@ -15,8 +15,24 @@ import gradio as gr
 
 from indextts.infer_vllm import IndexTTS
 
-model_dir = "/root/autodl-fs/index-tts"
-gpu_memory_utilization = 0.25
+import argparse
+parser = argparse.ArgumentParser(description="IndexTTS WebUI")
+parser.add_argument("--port", type=int, default=6006, help="Port to run the web UI on")
+parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the web UI on")
+parser.add_argument("--version", type=str, default="1.0", help="Host to run the web UI on")
+parser.add_argument("--model_dir", type=str, default="", help="Model checkpoints directory")
+parser.add_argument("--gpu_memory_utilization", type=float, default=0.25, help="Port to run the web UI on")
+cmd_args = parser.parse_args()
+
+CURRENT_DIR = os.path.abspath(os.path.dirname(__file__))
+model_dir = None
+if cmd_args.model_dir:
+    model_dir = cmd_args.model_dir
+else:
+    if cmd_args.version == "1.0":
+        model_dir = os.path.join(CURRENT_DIR, "checkpoints/Index-TTS-vLLM")
+    elif cmd_args.version == "1.5":
+        model_dir = os.path.join(CURRENT_DIR, "checkpoints/Index-TTS-1.5-vLLM")
 
 
 async def gen_single(prompts, text, progress=gr.Progress()):
@@ -36,7 +52,7 @@ def update_prompt_audio():
 
 
 if __name__ == "__main__":
-    tts = IndexTTS(model_dir=model_dir, gpu_memory_utilization=gpu_memory_utilization)
+    tts = IndexTTS(model_dir=model_dir, gpu_memory_utilization=cmd_args.gpu_memory_utilization)
 
     with gr.Blocks() as demo:
         mutex = threading.Lock()
@@ -73,4 +89,4 @@ if __name__ == "__main__":
         )
 
     demo.queue(20)
-    demo.launch(server_name="0.0.0.0", server_port=6006)
+    demo.launch(server_name=cmd_args.host, server_port=cmd_args.port)
