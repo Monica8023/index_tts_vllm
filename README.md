@@ -100,8 +100,8 @@ python api_server.py --model_dir /your/path/to/Index-TTS
 
 ### 启动参数
 - `--model_dir`: 必填，模型权重路径
-- `--host`: 服务ip地址，默认为 `6006`
-- `--port`: 服务端口，默认为 `0.0.0.0`
+- `--host`: 服务ip地址，默认为 `0.0.0.0`
+- `--port`: 服务端口，默认为 `6006`
 - `--gpu_memory_utilization`: vllm 显存占用率，默认设置为 `0.25`
 
 ### 请求示例
