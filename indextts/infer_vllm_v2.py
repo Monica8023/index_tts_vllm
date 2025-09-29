@@ -407,7 +407,7 @@ class IndexTTS2:
                 code_lens = []
                 for code in codes:
                     if self.stop_mel_token not in code:
-                        code_lens.append(len(code))
+                        # code_lens.append(len(code))
                         code_len = len(code)
                     else:
                         len_ = (code == self.stop_mel_token).nonzero(as_tuple=False)[0] + 1

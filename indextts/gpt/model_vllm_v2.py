@@ -147,7 +147,9 @@ class UnifiedVoice(nn.Module):
             top_p=0.8,
             top_k=30,  # 5, 30
             repetition_penalty=10.0,  # 8.0
-            max_tokens=768,  # 605
+            max_tokens=2048,  # 605
+            stop_token_ids=[self.stop_mel_token],
+            include_stop_str_in_output=True,
         )
 
     def build_aligned_inputs_and_targets(self, input, start_token, stop_token):

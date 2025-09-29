@@ -415,6 +415,8 @@ class UnifiedVoice(nn.Module):
             n_head=self.heads,
             gradient_checkpointing=False,
             use_cache=True,
+            bos_token_id=self.start_mel_token,
+            eos_token_id=self.stop_mel_token,
         )
         self.inference_model = GPT2InferenceModel(
             gpt_config,

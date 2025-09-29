@@ -8,7 +8,7 @@
 ## 项目简介
 该项目在 [index-tts](https://github.com/index-tts/index-tts) 的基础上使用 vllm 库重新实现了 gpt 模型的推理，加速了 index-tts 的推理过程。
 
-推理速度在单卡 RTX 4090 上的提升为：
+推理速度（Index-TTS-v1）在单卡 RTX 4090 上的提升为：
 - 单个请求的 RTF (Real-Time Factor)：≈0.3 -> ≈0.1
 - 单个请求的 gpt 模型 decode 速度：≈90 token / s -> ≈280 token / s
 - 并发量：gpu_memory_utilization设置为0.25（约5GB显存）的情况下，实测 16 左右的并发无压力（测速脚本参考 `simple_test.py`）
@@ -23,7 +23,10 @@
     - 对应：[createSpeech](https://platform.openai.com/docs/api-reference/audio/createSpeech)
 
 - **[2025-09-22]** 支持了 vllm v1 版本，IndexTTS2 正在兼容中
+
 - **[2025-09-28]** 支持了 IndexTTS2 的 webui 推理，并整理了权重文件，现在部署更加方便了 0.0 ；但当前版本对于 IndexTTS2 的 gpt 似乎并没有加速效果，待研究
+
+- **[2025-09-29]** 解决了 IndexTTS2 没有加速的问题，原因为兼容 v2 时漏设了 eos_token_id ，目前能够正常加速
 
 ## 使用步骤
 
