@@ -26,7 +26,9 @@
 
 - **[2025-09-28]** 支持了 IndexTTS2 的 webui 推理，并整理了权重文件，现在部署更加方便了！ \0.0/ ；但当前版本对于 IndexTTS2 的 gpt 似乎并没有加速效果，待研究
 
-- **[2025-09-29]** 解决了 IndexTTS2 没有加速的问题，原因为兼容 v2 时漏设了 eos_token_id ，目前能够正常加速
+- **[2025-09-29]** 解决了 IndexTTS2 的 gpt 模型推理加速无效的问题
+
+- **[2025-10-09]** 兼容 IndexTTS2 的 api 接口调用，请参考 [API](#api)，v1/1.5 的 api 接口以及 openai 兼容的接口可能还有 bug，晚点再修
 
 ## 使用步骤
 
@@ -95,10 +97,14 @@ python webui_v2.py
 
 ## API
 
-使用 fastapi 封装了 api 接口，启动示例如下，请将 `--model_dir` 改为你的模型的实际路径：
+使用 fastapi 封装了 api 接口，启动示例如下：
 
 ```bash
-python api_server.py --model_dir /your/path/to/Index-TTS
+# Index-TTS-1.0/1.5
+python api_server.py
+
+# IndexTTS-2
+python api_server_v2.py
 ```
 
 ### 启动参数
@@ -107,8 +113,9 @@ python api_server.py --model_dir /your/path/to/Index-TTS
 - `--port`: 服务端口，默认为 `6006`
 - `--gpu_memory_utilization`: vllm 显存占用率，默认设置为 `0.25`
 
-### 请求示例
-参考 `api_example.py`
+### API 请求示例
+- v1/1.5 请参考 `api_example.py`
+- v2 请参考 `api_example_v2.py`
 
 ### OpenAI API
 - 添加 /audio/speech api 路径，兼容 OpenAI 接口

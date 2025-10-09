@@ -1,8 +1,5 @@
 
 import os
-# os.environ["CUDA_VISIBLE_DEVICES"] = "7"
-import patch_vllm  # ⚠️ Monkey Patch, do not delete this line
-
 import asyncio
 import io
 import traceback
