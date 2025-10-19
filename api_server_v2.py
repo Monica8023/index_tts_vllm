@@ -20,7 +20,12 @@ tts = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global tts
-    tts = IndexTTS2(model_dir=args.model_dir, is_fp16=args.is_fp16, gpu_memory_utilization=args.gpu_memory_utilization)
+    tts = IndexTTS2(
+        model_dir=args.model_dir,
+        is_fp16=args.is_fp16,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        qwenemo_gpu_memory_utilization=args.qwenemo_gpu_memory_utilization,
+    )
     yield
 
 
@@ -128,6 +133,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_dir", type=str, default="checkpoints/IndexTTS-2-vLLM", help="Model checkpoints directory")
     parser.add_argument("--is_fp16", action="store_true", default=False, help="Fp16 infer")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.25)
+    parser.add_argument("--qwenemo_gpu_memory_utilization", type=float, default=0.10)
     parser.add_argument("--verbose", action="store_true", default=False, help="Enable verbose mode")
     args = parser.parse_args()
     

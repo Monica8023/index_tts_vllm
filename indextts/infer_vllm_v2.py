@@ -2,22 +2,19 @@ import os
 import random
 import re
 import time
-from subprocess import CalledProcessError
 import traceback
 from typing import List
+import uuid
 
 import librosa
-import numpy as np
-import sentencepiece as spm
 import torch
 import torchaudio
-from torch.nn.utils.rnn import pad_sequence
+# from torch.nn.utils.rnn import pad_sequence
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from transformers import SeamlessM4TFeatureExtractor
 from transformers import AutoTokenizer
 from modelscope import AutoModelForCausalLM
-from huggingface_hub import hf_hub_download
 import safetensors
 
 import warnings
@@ -39,10 +36,14 @@ from indextts.s2mel.modules.audio import mel_spectrogram
 
 import torch.nn.functional as F
 
+from vllm import SamplingParams, TokensPrompt
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.v1.engine.async_llm import AsyncLLM
+
 
 class IndexTTS2:
     def __init__(
-        self, model_dir="checkpoints", is_fp16=False, device=None, use_cuda_kernel=None, gpu_memory_utilization=0.25
+        self, model_dir="checkpoints", is_fp16=False, device=None, use_cuda_kernel=None, gpu_memory_utilization=0.25, qwenemo_gpu_memory_utilization=0.10
     ):
         """
         Args:
@@ -76,9 +77,6 @@ class IndexTTS2:
         self.dtype = torch.float16 if self.is_fp16 else None
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
 
-        from vllm.engine.arg_utils import AsyncEngineArgs
-        from vllm.v1.engine.async_llm import AsyncLLM
-
         vllm_dir = os.path.join(model_dir, "gpt")
         engine_args = AsyncEngineArgs(
             model=vllm_dir,
@@ -89,7 +87,10 @@ class IndexTTS2:
         )
         indextts_vllm = AsyncLLM.from_engine_args(engine_args)
 
-        self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path))
+        self.qwen_emo = QwenEmotion(
+            os.path.join(self.model_dir, self.cfg.qwen_emo_path),
+            gpu_memory_utilization=qwenemo_gpu_memory_utilization,
+        )
 
         self.gpt = UnifiedVoice(indextts_vllm, **self.cfg.gpt)
         self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
@@ -199,15 +200,6 @@ class IndexTTS2:
         }
         self.mel_fn = lambda x: mel_spectrogram(x, **mel_fn_args)
 
-        # 缓存参考音频：
-        self.cache_spk_cond = None
-        self.cache_s2mel_style = None
-        self.cache_s2mel_prompt = None
-        self.cache_spk_audio_prompt = None
-        self.cache_emo_cond = None
-        self.cache_emo_audio_prompt = None
-        self.cache_mel = None
-
         self.speaker_dict = {}
 
     @torch.no_grad()
@@ -259,7 +251,7 @@ class IndexTTS2:
             # assert emo_alpha == 1.0
             if emo_text is None:
                 emo_text = text
-            emo_dict, content = self.qwen_emo.inference(emo_text)
+            emo_dict, content = await self.qwen_emo.inference(emo_text)
             print(emo_dict)
             emo_vector = list(emo_dict.values())
 
@@ -274,45 +266,32 @@ class IndexTTS2:
             emo_alpha = 1.0
             # assert emo_alpha == 1.0
 
-        # 如果参考音频改变了，才需要重新生成, 提升速度
-        if self.cache_spk_cond is None or self.cache_spk_audio_prompt != spk_audio_prompt:
-            audio, sr = librosa.load(spk_audio_prompt)
-            audio = torch.tensor(audio).unsqueeze(0)
-            audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
-            audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
+        audio, sr = librosa.load(spk_audio_prompt)
+        audio = torch.tensor(audio).unsqueeze(0)
+        audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
+        audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
 
-            inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
-            input_features = inputs["input_features"]
-            attention_mask = inputs["attention_mask"]
-            input_features = input_features.to(self.device)
-            attention_mask = attention_mask.to(self.device)
-            spk_cond_emb = self.get_emb(input_features, attention_mask)
+        inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
+        input_features = inputs["input_features"]
+        attention_mask = inputs["attention_mask"]
+        input_features = input_features.to(self.device)
+        attention_mask = attention_mask.to(self.device)
+        spk_cond_emb = self.get_emb(input_features, attention_mask)
 
-            _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
-            ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
-            ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
-            feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(ref_mel.device),
-                                                     num_mel_bins=80,
-                                                     dither=0,
-                                                     sample_frequency=16000)
-            feat = feat - feat.mean(dim=0, keepdim=True)  # feat2另外一个滤波器能量组特征[922, 80]
-            style = self.campplus_model(feat.unsqueeze(0))  # 参考音频的全局style2[1,192]
+        _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
+        ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
+        ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
+        feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(ref_mel.device),
+                                                    num_mel_bins=80,
+                                                    dither=0,
+                                                    sample_frequency=16000)
+        feat = feat - feat.mean(dim=0, keepdim=True)  # feat2另外一个滤波器能量组特征[922, 80]
+        style = self.campplus_model(feat.unsqueeze(0))  # 参考音频的全局style2[1,192]
 
-            prompt_condition = self.s2mel.models['length_regulator'](S_ref,
-                                                                     ylens=ref_target_lengths,
-                                                                     n_quantizers=3,
-                                                                     f0=None)[0]
-
-            self.cache_spk_cond = spk_cond_emb
-            self.cache_s2mel_style = style
-            self.cache_s2mel_prompt = prompt_condition
-            self.cache_spk_audio_prompt = spk_audio_prompt
-            self.cache_mel = ref_mel
-        else:
-            style = self.cache_s2mel_style
-            prompt_condition = self.cache_s2mel_prompt
-            spk_cond_emb = self.cache_spk_cond
-            ref_mel = self.cache_mel
+        prompt_condition = self.s2mel.models['length_regulator'](S_ref,
+                                                                    ylens=ref_target_lengths,
+                                                                    n_quantizers=3,
+                                                                    f0=None)[0]
 
         if emo_vector is not None:
             weight_vector = torch.tensor(emo_vector).to(self.device)
@@ -327,19 +306,13 @@ class IndexTTS2:
             emovec_mat = torch.sum(emovec_mat, 0)
             emovec_mat = emovec_mat.unsqueeze(0)
 
-        if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
-            emo_audio, _ = librosa.load(emo_audio_prompt, sr=16000)
-            emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
-            emo_input_features = emo_inputs["input_features"]
-            emo_attention_mask = emo_inputs["attention_mask"]
-            emo_input_features = emo_input_features.to(self.device)
-            emo_attention_mask = emo_attention_mask.to(self.device)
-            emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
-
-            self.cache_emo_cond = emo_cond_emb
-            self.cache_emo_audio_prompt = emo_audio_prompt
-        else:
-            emo_cond_emb = self.cache_emo_cond
+        emo_audio, _ = librosa.load(emo_audio_prompt, sr=16000)
+        emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
+        emo_input_features = emo_inputs["input_features"]
+        emo_attention_mask = emo_inputs["attention_mask"]
+        emo_input_features = emo_input_features.to(self.device)
+        emo_attention_mask = emo_attention_mask.to(self.device)
+        emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
 
         text_tokens_list = self.tokenizer.tokenize(text)
         sentences = self.tokenizer.split_sentences(text_tokens_list, max_text_tokens_per_sentence)
@@ -392,14 +365,15 @@ class IndexTTS2:
                 )
                 # print("codes: ", codes)
                 gpt_gen_time += time.perf_counter() - m_start_time
-                if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
-                    warnings.warn(
-                        f"WARN: generation stopped due to exceeding `max_mel_tokens` ({self.cfg.gpt.max_mel_tokens}). "
-                        f"Input text tokens: {text_tokens.shape[1]}. "
-                        f"Consider reducing `max_text_tokens_per_sentence`({max_text_tokens_per_sentence}) or increasing `max_mel_tokens`.",
-                        category=RuntimeWarning
-                    )
-                    has_warned = True
+                # if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
+                #     warnings.warn(
+                #         f"WARN: generation stopped due to exceeding `max_mel_tokens` ({self.cfg.gpt.max_mel_tokens}). "
+                #         f"Current output shape: {codes.shape}. "
+                #         f"Input text tokens: {text_tokens.shape[1]}. "
+                #         f"Consider reducing `max_text_tokens_per_sentence`({max_text_tokens_per_sentence}) or increasing `max_mel_tokens`.",
+                #         category=RuntimeWarning
+                #     )
+                #     has_warned = True
 
                 # codes = torch.tensor(codes, dtype=torch.long, device=self.device).unsqueeze(0)
                 code_lens = torch.tensor([codes.shape[-1]], device=codes.device, dtype=codes.dtype)
@@ -519,15 +493,26 @@ def find_most_similar_cosine(query_vector, matrix):
     return most_similar_index
 
 class QwenEmotion:
-    def __init__(self, model_dir):
+    def __init__(self, model_dir, gpu_memory_utilization=0.1):
         self.model_dir = model_dir
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_dir,
-            torch_dtype="float16",  # "auto"
-            # device_map="auto"
+
+        # self.model = AutoModelForCausalLM.from_pretrained(
+        #     self.model_dir,
+        #     torch_dtype="float16",  # "auto"
+        #     # device_map="auto"
+        # )
+        # self.model = self.model.to("cuda")
+
+        engine_args = AsyncEngineArgs(
+            model=model_dir,
+            tensor_parallel_size=1,
+            dtype="auto",
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=2048,
         )
-        self.model = self.model.to("cuda")
+        self.model = AsyncLLM.from_engine_args(engine_args)
+
         self.prompt = "文本情感分类"
         self.convert_dict = {
             "愤怒": "angry",
@@ -585,8 +570,7 @@ class QwenEmotion:
 
         return emotion_dict
 
-    def inference(self, text_input):
-        start = time.time()
+    async def inference(self, text_input):
         messages = [
             {"role": "system", "content": f"{self.prompt}"},
             {"role": "user", "content": f"{text_input}"}
@@ -597,15 +581,26 @@ class QwenEmotion:
             add_generation_prompt=True,
             enable_thinking=False,
         )
-        model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+        model_inputs = self.tokenizer(text)["input_ids"]
+        # model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
 
         # conduct text completion
-        generated_ids = self.model.generate(
-            **model_inputs,
-            max_new_tokens=32768,
-            pad_token_id=self.tokenizer.eos_token_id
+        # generated_ids = self.model.generate(
+        #     **model_inputs,
+        #     max_new_tokens=32768,
+        #     pad_token_id=self.tokenizer.eos_token_id
+        # )
+        # output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
+
+        
+        sampling_params = SamplingParams(
+            max_tokens=2048,  # 32768
         )
-        output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
+        tokens_prompt = TokensPrompt(prompt_token_ids=model_inputs)
+        output_generator = self.model.generate(tokens_prompt, sampling_params=sampling_params, request_id=uuid.uuid4().hex)
+        async for output in output_generator:
+            pass
+        output_ids = output.outputs[0].token_ids[:-2]
 
         # parsing thinking content
         try:
