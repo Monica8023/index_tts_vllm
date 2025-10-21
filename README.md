@@ -30,8 +30,6 @@
 
 - s2mel 的推理加速
 
-- qwen0.6bemo4-merge 的 vllm 推理
-
 ## 使用步骤
 
 ### 1. git 本项目
