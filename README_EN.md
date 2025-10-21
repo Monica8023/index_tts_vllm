@@ -30,8 +30,6 @@ Inference speed improvement (Index-TTS-v1/v1.5) on a single RTX 4090:
 
 - Acceleration of s2mel inference.
 
-- vllm inference for qwen0.6bemo4-merge.
-
 ## Usage Steps
 
 ### 1. Clone this project
