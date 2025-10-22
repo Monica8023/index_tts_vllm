@@ -1,6 +1,9 @@
+import time
 import uuid
 import os
 import functools
+
+from loguru import logger
 import patch_vllm  # ⚠️ Monkey Patch, do not delete this line
 
 import torch
@@ -211,12 +214,12 @@ class UnifiedVoice(nn.Module):
 
         speech_conditioning_latent = self.get_conditioning(speech_condition.transpose(1,2), cond_lengths)
         if emo_vec is None:
-            print('compute emo vec')
+            logger.info('compute emo vec')
             emo_vec = self.get_emo_conditioning(emo_speech_condition.transpose(1,2), emo_cond_lengths)
             emo_vec = self.emovec_layer(emo_vec)
             emo_vec = self.emo_layer(emo_vec)
         else:
-            print('Use the specified emotion vector')
+            logger.info('Use the specified emotion vector')
 
         tmp = torch.zeros(text_inputs.size(0)).to(text_inputs.device)
         duration_emb =  self.speed_emb(torch.zeros_like(tmp).long())
@@ -236,11 +239,16 @@ class UnifiedVoice(nn.Module):
         multi_modal_data = {"audio": {"audio_embeds": [inputs_embeds.squeeze(0).cpu()]}}
         tokens_prompt = TokensPrompt(prompt_token_ids=fake_inputs, multi_modal_data=multi_modal_data)
         # tokens_prompt = TokensPrompt(prompt_token_ids=fake_inputs, multi_modal_data=multi_modal_data)
-        output_generator = self.llm.generate(tokens_prompt, sampling_params=self.sampling_params, request_id=uuid.uuid4().hex)
-        # latent = []
+        request_id = uuid.uuid4().hex
+        output_generator = self.llm.generate(tokens_prompt, sampling_params=self.sampling_params, request_id=request_id)
+        gpt_stt = time.time()
+        prefill_flag = True
         async for output in output_generator:
-            # latent.append(output.hidden_states.clone())
-            pass
+            if prefill_flag:
+                logger.info(f"[{request_id}] [prefill time: {(time.time() - gpt_stt):.4f}]")
+                gpt_stt = time.time()
+                prefill_flag = False
+        logger.info(f"[{request_id}] [decode time: {(time.time() - gpt_stt):.4f}] [decode len: {len(output.outputs[0].token_ids)}]")
         codes = output.outputs[0].token_ids[:-2]
         codes = torch.tensor(codes, device=text_inputs.device, dtype=torch.long).unsqueeze(0)
 

@@ -16,6 +16,7 @@ from transformers import SeamlessM4TFeatureExtractor
 from transformers import AutoTokenizer
 from modelscope import AutoModelForCausalLM
 import safetensors
+from loguru import logger
 
 import warnings
 
@@ -69,7 +70,7 @@ class IndexTTS2:
             self.device = "cpu"
             self.is_fp16 = False
             self.use_cuda_kernel = False
-            print(">> Be patient, it may take a while to run in CPU mode.")
+            logger.info(">> Be patient, it may take a while to run in CPU mode.")
 
         cfg_path = os.path.join(model_dir, "config.yaml")
         self.cfg = OmegaConf.load(cfg_path)
@@ -101,7 +102,7 @@ class IndexTTS2:
         # else:
         #     self.gpt.eval()
         self.gpt.eval()
-        print(">> GPT weights restored from:", self.gpt_path)
+        logger.info(f">> GPT weights restored from: {self.gpt_path}")
 
         if self.use_cuda_kernel:
             # preload the CUDA kernel for BigVGAN
@@ -109,10 +110,10 @@ class IndexTTS2:
                 from indextts.BigVGAN.alias_free_activation.cuda import load
 
                 anti_alias_activation_cuda = load.load()
-                print(">> Preload custom CUDA kernel for BigVGAN", anti_alias_activation_cuda)
+                logger.info(f">> Preload custom CUDA kernel for BigVGAN {anti_alias_activation_cuda}")
             except Exception as ex:
                 traceback.print_exc()
-                print(">> Failed to load custom CUDA kernel for BigVGAN. Falling back to torch.")
+                logger.info(">> Failed to load custom CUDA kernel for BigVGAN. Falling back to torch.")
                 self.use_cuda_kernel = False
 
         self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained(
@@ -129,13 +130,11 @@ class IndexTTS2:
         self.semantic_std = self.semantic_std.to(self.device)
 
         semantic_codec = build_semantic_codec(self.cfg.semantic_codec)
-        # semantic_code_ckpt = hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors", cache_dir=os.path.join(self.model_dir, "semantic_codec"))
         semantic_code_ckpt = os.path.join(self.model_dir, "semantic_codec/model.safetensors")
-        # print("semantic_code_ckpt", semantic_code_ckpt)
         safetensors.torch.load_model(semantic_codec, semantic_code_ckpt)
         self.semantic_codec = semantic_codec.to(self.device)
         self.semantic_codec.eval()
-        print('>> semantic_codec weights restored from: {}'.format(semantic_code_ckpt))
+        logger.info('>> semantic_codec weights restored from: {}'.format(semantic_code_ckpt))
 
         s2mel_path = os.path.join(self.model_dir, self.cfg.s2mel_checkpoint)
         s2mel = MyModel(self.cfg.s2mel, use_gpt_latent=True)
@@ -150,7 +149,7 @@ class IndexTTS2:
         self.s2mel = s2mel.to(self.device)
         self.s2mel.models['cfm'].estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
         self.s2mel.eval()
-        print(">> s2mel weights restored from:", s2mel_path)
+        logger.info(f">> s2mel weights restored from: {s2mel_path}")
 
         # load campplus_model
         # campplus_ckpt_path = hf_hub_download(
@@ -161,7 +160,7 @@ class IndexTTS2:
         campplus_model.load_state_dict(torch.load(campplus_ckpt_path, map_location="cpu"))
         self.campplus_model = campplus_model.to(self.device)
         self.campplus_model.eval()
-        print(">> campplus_model weights restored from:", campplus_ckpt_path)
+        logger.info(f">> campplus_model weights restored from: {campplus_ckpt_path}")
 
         bigvgan_name = self.cfg.vocoder.name
         # self.bigvgan = bigvgan.BigVGAN.from_pretrained(bigvgan_name, use_cuda_kernel=False, cache_dir=os.path.join(self.model_dir, "bigvgan"))
@@ -169,14 +168,14 @@ class IndexTTS2:
         self.bigvgan = self.bigvgan.to(self.device)
         self.bigvgan.remove_weight_norm()
         self.bigvgan.eval()
-        print(">> bigvgan weights restored from:", bigvgan_name)
+        logger.info(f">> bigvgan weights restored from: {bigvgan_name}")
 
         self.bpe_path = os.path.join(self.model_dir, "bpe.model")  # self.cfg.dataset["bpe_model"]
         self.normalizer = TextNormalizer()
         self.normalizer.load()
-        print(">> TextNormalizer loaded")
+        logger.info(">> TextNormalizer loaded")
         self.tokenizer = TextTokenizer(self.bpe_path, self.normalizer)
-        print(">> bpe model loaded from:", self.bpe_path)
+        logger.info(f">> bpe model loaded from: {self.bpe_path}")
 
         emo_matrix = torch.load(os.path.join(self.model_dir, self.cfg.emo_matrix))
         self.emo_matrix = emo_matrix.to(self.device)
@@ -241,7 +240,7 @@ class IndexTTS2:
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
               verbose=False, max_text_tokens_per_sentence=120, **generation_kwargs):
-        print(">> start inference...")
+        logger.info(">> start inference...")
         start_time = time.perf_counter()
 
         if use_emo_text:
@@ -252,7 +251,7 @@ class IndexTTS2:
             if emo_text is None:
                 emo_text = text
             emo_dict, content = await self.qwen_emo.inference(emo_text)
-            print(emo_dict)
+            # logger.info(emo_dict)
             emo_vector = list(emo_dict.values())
 
         if emo_vector is not None:
@@ -363,7 +362,6 @@ class IndexTTS2:
                     emo_cond_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
                     emo_vec=emovec,
                 )
-                # print("codes: ", codes)
                 gpt_gen_time += time.perf_counter() - m_start_time
                 # if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
                 #     warnings.warn(
@@ -442,7 +440,6 @@ class IndexTTS2:
 
                     m_start_time = time.perf_counter()
                     wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)
-                    print(wav.shape)
                     bigvgan_time += time.perf_counter() - m_start_time
                     wav = wav.squeeze(1)
 
@@ -457,13 +454,13 @@ class IndexTTS2:
         
         wav = torch.cat(wavs, dim=1)
         wav_length = wav.shape[-1] / sampling_rate
-        print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
-        print(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
-        print(f">> s2mel_time: {s2mel_time:.2f} seconds")
-        print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
-        print(f">> Total inference time: {end_time - start_time:.2f} seconds")
-        print(f">> Generated audio length: {wav_length:.2f} seconds")
-        print(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
+        logger.info(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
+        logger.info(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
+        logger.info(f">> s2mel_time: {s2mel_time:.2f} seconds")
+        logger.info(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
+        logger.info(f">> Total inference time: {end_time - start_time:.2f} seconds")
+        logger.info(f">> Generated audio length: {wav_length:.2f} seconds")
+        logger.info(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
 
         # save audio
         wav = wav.cpu()  # to cpu
@@ -471,11 +468,11 @@ class IndexTTS2:
             # 直接保存音频到指定路径中
             if os.path.isfile(output_path):
                 os.remove(output_path)
-                print(">> remove old wav file:", output_path)
+                logger.info(f">> remove old wav file: {output_path}")
             if os.path.dirname(output_path) != "":
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
             torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)
-            print(">> wav file saved to:", output_path)
+            logger.info(f">> wav file saved to: {output_path}")
             return output_path
         else:
             # 返回以符合Gradio的格式要求
@@ -536,7 +533,7 @@ class QwenEmotion:
         content = content.replace("}", "")
         content = content.replace('"', "")
         parts = content.strip().split(',')
-        print(parts)
+        # print(parts)
         parts_dict = {}
         desired_order = ["高兴", "愤怒", "悲伤", "恐惧", "反感", "低落", "惊讶", "自然"]
         for part in parts:

@@ -13,6 +13,9 @@ import time
 import soundfile as sf
 from typing import List, Optional, Union
 
+from loguru import logger
+logger.add("logs/api_server_v2.log", rotation="10 MB", retention=10, level="DEBUG", enqueue=True)
+
 from indextts.infer_vllm_v2 import IndexTTS2
 
 tts = None
@@ -101,7 +104,7 @@ async def tts_api_url(request: Request):
         else:
             vec = None
 
-        print(f"Emo control mode:{emo_control_method},vec:{vec}")
+        # logger.info(f"Emo control mode:{emo_control_method}, vec:{vec}")
         sr, wav = await tts.infer(spk_audio_prompt=spk_audio_path, text=text,
                         output_path=None,
                         emo_audio_prompt=emo_ref_path, emo_alpha=emo_weight,
