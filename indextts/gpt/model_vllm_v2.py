@@ -229,6 +229,7 @@ class UnifiedVoice(nn.Module):
         text_inputs, _ = self.build_aligned_inputs_and_targets(text_inputs, self.start_text_token, self.stop_text_token)
         text_emb = self.text_embedding(text_inputs) + self.text_pos_embedding(text_inputs)
 
+        logger.error(f"conds_latent: {conds_latent.shape}, text_emb: {text_emb.shape}")
         emb = torch.cat([conds_latent, text_emb], dim=1)
 
         mel_start_emb = self.mel_embedding(torch.full((emb.shape[0], 1,), fill_value=self.start_mel_token, dtype=torch.long, device=text_inputs.device))
@@ -237,7 +238,7 @@ class UnifiedVoice(nn.Module):
 
         fake_inputs = PLACEHOLDER_TOKEN * 1  # [PLACEHOLDER_TOKEN_ID]
         multi_modal_data = {"audio": {"audio_embeds": [inputs_embeds.squeeze(0).cpu()]}}
-        tokens_prompt = TokensPrompt(prompt_token_ids=fake_inputs, multi_modal_data=multi_modal_data)
+        tokens_prompt = TokensPrompt(prompt=fake_inputs, multi_modal_data=multi_modal_data)
         # tokens_prompt = TokensPrompt(prompt_token_ids=fake_inputs, multi_modal_data=multi_modal_data)
         request_id = uuid.uuid4().hex
         output_generator = self.llm.generate(tokens_prompt, sampling_params=self.sampling_params, request_id=request_id)
