@@ -229,7 +229,6 @@ class UnifiedVoice(nn.Module):
         text_inputs, _ = self.build_aligned_inputs_and_targets(text_inputs, self.start_text_token, self.stop_text_token)
         text_emb = self.text_embedding(text_inputs) + self.text_pos_embedding(text_inputs)
 
-        logger.error(f"conds_latent: {conds_latent.shape}, text_emb: {text_emb.shape}")
         emb = torch.cat([conds_latent, text_emb], dim=1)
 
         mel_start_emb = self.mel_embedding(torch.full((emb.shape[0], 1,), fill_value=self.start_mel_token, dtype=torch.long, device=text_inputs.device))

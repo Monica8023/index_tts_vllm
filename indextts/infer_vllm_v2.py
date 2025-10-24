@@ -447,6 +447,7 @@ class IndexTTS2:
                 if verbose:
                     print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
                 # wavs.append(wav[:, :-512])
+                # logger.error(f"time per token: {wav.shape[-1] / sampling_rate / codes.shape[-1]}, {wav.shape[-1] / sampling_rate / vc_target.shape[-1]}")
                 wavs.append(wav.cpu())  # to cpu before saving
         end_time = time.perf_counter()
 

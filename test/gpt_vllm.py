@@ -7,6 +7,18 @@ import os
 from typing import AsyncGenerator, List, Dict, Any
 import numpy as np
 
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # # 以下设置可能会轻微影响性能，但确保完全可复现
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
+
+set_seed(42)
+
 import sys
 root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, root_dir)
@@ -23,18 +35,18 @@ model_dir = os.path.join(root_dir, "checkpoints/IndexTTS-2-vLLM")
 
 vllm_dir = os.path.join(model_dir, "gpt")
 
-sampling_params = SamplingParams(
-    temperature=1.0,
-    top_p=0.8,
-    top_k=30,
-    repetition_penalty=10.0,
-    max_tokens=1818,  # 605
-    ignore_eos=True,
-    stop_token_ids=[],  # 8193
-)
-
 async def run_single_inference(llm: AsyncLLM, inputs_embeds: torch.Tensor):
     request_id = uuid.uuid4().hex
+
+    sampling_params = SamplingParams(
+        temperature=1.0,
+        top_p=0.8,
+        top_k=30,
+        repetition_penalty=10.0,
+        max_tokens=random.randint(400, 1200),  # 8s - 24s # 1818
+        ignore_eos=True,
+        stop_token_ids=[],  # 8193
+    )
     
     multi_modal_data = {"audio": {"audio_embeds": [inputs_embeds.squeeze(0).cpu()]}}
     fake_inputs = PLACEHOLDER_TOKEN * 1
@@ -86,14 +98,14 @@ async def run_user_simulation(llm: AsyncLLM, inputs_embeds: torch.Tensor, num_ru
 async def benchmark(llm_engine, concurrency_levels, runs_per_user):
     hidden_dim = 1280
     conds_len = 34
-    max_text_tokens = 600
+    max_text_tokens = 200
 
     # warm up
     fake_inputs_embeds = torch.randn(
         1, 
         conds_len + max_text_tokens,
         hidden_dim, 
-        dtype=torch.float16, 
+        dtype=torch.float16,
         device="cpu"
     )
     await run_single_inference(llm_engine, fake_inputs_embeds) 
@@ -163,8 +175,8 @@ async def benchmark(llm_engine, concurrency_levels, runs_per_user):
 
 if __name__ == "__main__":
     gpu_memory_utilization = 0.5  # 0.25
-    concurrency_levels = [64]  # 并发数1, 4, 8, 16, 32, 
-    runs_per_user = 5  # 每个并发的请求数
+    concurrency_levels = [1, 4, 8, 16, 32, 64]  # 并发数
+    runs_per_user = 10  # 每个并发的请求数
 
     engine_args = AsyncEngineArgs(
         model=vllm_dir,

@@ -1,95 +1,115 @@
-# 基础信息
-RTX 4090
-gpu_memory_utilization = 0.5
-(EngineCore_DP0 pid=61946) INFO 10-24 01:36:20 [kv_cache_utils.py:868] Maximum concurrency for 1,818 tokens per request: 51.20x
-max_num_seqs = 50
+## 基础信息
+### 测试对象
+IndexTTS-2-vLLM（GPT 部分）
+
+### 设备信息
+
+- RTX 4090
+
+### 环境
+
+- vllm==0.10.2
+
+### 设置
+
+- gpu_memory_utilization = 0.5
+- max_num_seqs = 50
+- vllm log：(EngineCore_DP0 pid=61946) INFO 10-24 01:36:20 [kv_cache_utils.py:868] Maximum concurrency for 1,818 tokens per request: 51.20x
+
+## 测试策略
+
+- 并发梯度：1 → 4 → 8 → 16 → 32 → 64 用户
+- 单用户行为：连续发 10 次请求（run_user_simulation），每次 max_tokens 在 400-1200 随机（≈8-24 s 音频），模拟真实并发请求
+- 请求内容：请求内容为服从正态分布的随机向量，避免触发 kv cache
+
+## 测试结果
 
 ## Concurrency Level: 1
 
-*   **Total Requests:** 5
-*   **Total Time:** 21.68 s
-*   **Total Throughput:** 272.56 tokens/s
+*   **Total Requests:** 10
+*   **Total Time:** 26.95 s
+*   **Total Throughput:** 271.99 tokens/s
 
 | Metric                 | Min      | Max       | Mean      | P50       | P95       | P99       |
 |------------------------|----------|-----------|-----------|-----------|-----------|-----------|
-| TTFT (ms)              | 10.83    | 23.09     | 15.05     | 13.91     | 21.42     | 22.76     |
-| Latency (ms)           | 4143.74  | 4624.17   | 4336.36   | 4242.69   | 4602.00   | 4619.74   |
-| Num Generated Tokens   | 1182     | 1182      | 1182.00   | 1182      | 1182      | 1182      |
+| TTFT (ms)              | 9.18     | 21.22     | 12.38     | 11.42     | 17.90     | 20.55     |
+| Latency (ms)           | 1448.54  | 4625.49   | 2694.31   | 2148.91   | 4409.40   | 4582.28   |
+| Num Generated Tokens   | 423      | 1157      | 732.90    | 637       | 1155      | 1157      |
 
 ----------------------------------------
 
 ## Concurrency Level: 4
 
-*   **Total Requests:** 20
-*   **Total Time:** 23.62 s
-*   **Total Throughput:** 1000.78 tokens/s
+*   **Total Requests:** 40
+*   **Total Time:** 30.66 s
+*   **Total Throughput:** 1007.03 tokens/s
 
 | Metric                 | Min      | Max       | Mean      | P50       | P95       | P99       |
 |------------------------|----------|-----------|-----------|-----------|-----------|-----------|
-| TTFT (ms)              | 11.88    | 66.41     | 23.87     | 15.56     | 63.59     | 65.84     |
-| Latency (ms)           | 4475.67  | 5092.43   | 4721.80   | 4684.37   | 5090.55   | 5092.06   |
-| Num Generated Tokens   | 1182     | 1182      | 1182.00   | 1182      | 1182      | 1182      |
+| TTFT (ms)              | 8.30     | 41.17     | 14.21     | 11.45     | 38.04     | 40.52     |
+| Latency (ms)           | 1541.11  | 4761.30   | 2945.13   | 2857.07   | 4398.97   | 4726.94   |
+| Num Generated Tokens   | 404      | 1179      | 771.77    | 756       | 1157      | 1177      |
 
 ----------------------------------------
 
 ## Concurrency Level: 8
 
-*   **Total Requests:** 40
-*   **Total Time:** 28.57 s
-*   **Total Throughput:** 1654.76 tokens/s
+*   **Total Requests:** 80
+*   **Total Time:** 36.89 s
+*   **Total Throughput:** 1741.31 tokens/s
 
 | Metric                 | Min      | Max       | Mean      | P50       | P95       | P99       |
 |------------------------|----------|-----------|-----------|-----------|-----------|-----------|
-| TTFT (ms)              | 11.51    | 66.72     | 24.84     | 18.71     | 56.55     | 63.84     |
-| Latency (ms)           | 5549.86  | 5928.19   | 5708.35   | 5670.35   | 5923.96   | 5926.91   |
-| Num Generated Tokens   | 1182     | 1182      | 1182.00   | 1182      | 1182      | 1182      |
+| TTFT (ms)              | 8.31     | 43.53     | 14.39     | 12.65     | 35.73     | 41.83     |
+| Latency (ms)           | 1759.68  | 5286.03   | 3336.76   | 3138.05   | 4887.24   | 5250.43   |
+| Num Generated Tokens   | 430      | 1192      | 802.91    | 774       | 1144      | 1190      |
 
 ----------------------------------------
 
 ## Concurrency Level: 16
 
-*   **Total Requests:** 80
-*   **Total Time:** 37.04 s
-*   **Total Throughput:** 2552.87 tokens/s
+*   **Total Requests:** 160
+*   **Total Time:** 44.64 s
+*   **Total Throughput:** 2883.50 tokens/s
 
 | Metric                 | Min      | Max       | Mean      | P50       | P95       | P99       |
 |------------------------|----------|-----------|-----------|-----------|-----------|-----------|
-| TTFT (ms)              | 11.92    | 102.98    | 37.23     | 26.75     | 91.33     | 100.72    |
-| Latency (ms)           | 7297.13  | 7529.71   | 7398.85   | 7352.87   | 7528.42   | 7529.30   |
-| Num Generated Tokens   | 1182     | 1182      | 1182.00   | 1182      | 1182      | 1182      |
+| TTFT (ms)              | 9.40     | 41.57     | 14.47     | 11.44     | 33.03     | 39.86     |
+| Latency (ms)           | 2043.53  | 6397.30   | 4126.63   | 4217.07   | 6131.03   | 6342.06   |
+| Num Generated Tokens   | 398      | 1195      | 804.56    | 830       | 1166      | 1183      |
 
 ----------------------------------------
 
 ## Concurrency Level: 32
 
-*   **Total Requests:** 160
-*   **Total Time:** 56.30 s
-*   **Total Throughput:** 3359.33 tokens/s
+*   **Total Requests:** 320
+*   **Total Time:** 62.69 s
+*   **Total Throughput:** 3998.44 tokens/s
 
 | Metric                 | Min      | Max       | Mean      | P50       | P95       | P99       |
 |------------------------|----------|-----------|-----------|-----------|-----------|-----------|
-| TTFT (ms)              | 15.10    | 153.09    | 52.47     | 35.18     | 126.38    | 148.32    |
-| Latency (ms)           | 10973.86 | 11487.38  | 11239.08  | 11281.69  | 11462.90  | 11478.07  |
-| Num Generated Tokens   | 1182     | 1182      | 1182.00   | 1182      | 1182      | 1182      |
+| TTFT (ms)              | 10.76    | 83.00     | 20.20     | 15.16     | 61.46     | 78.49     |
+| Latency (ms)           | 2626.30  | 8564.35   | 5374.98   | 5188.72   | 7984.32   | 8338.44   |
+| Num Generated Tokens   | 399      | 1196      | 783.34    | 770       | 1144      | 1169      |
 
 ----------------------------------------
 
 ## Concurrency Level: 64
 
-*   **Total Requests:** 320
-*   **Total Time:** 100.63 s
-*   **Total Throughput:** 3758.67 tokens/s
+*   **Total Requests:** 640
+*   **Total Time:** 102.13 s
+*   **Total Throughput:** 5090.80 tokens/s
 
 | Metric                 | Min      | Max       | Mean      | P50       | P95       | P99       |
 |------------------------|----------|-----------|-----------|-----------|-----------|-----------|
-| TTFT (ms)              | 50.24    | 15433.53  | 4084.72   | 147.73    | 15390.44  | 15423.79  |
-| Latency (ms)           | 8665.13  | 30683.47  | 18928.13  | 15493.74  | 30598.44  | 30680.98  |
-| Num Generated Tokens   | 1182     | 1182      | 1182.00   | 1182      | 1182      | 1182      |
+| TTFT (ms)              | 10.83    | 5527.29   | 1901.63   | 1962.80   | 3217.76   | 4771.17   |
+| Latency (ms)           | 3278.74  | 16685.37  | 9343.78   | 9434.96   | 12897.00  | 14347.68  |
+| Num Generated Tokens   | 398      | 1197      | 812.35    | 828       | 1167      | 1189      |
 
 ----------------------------------------
 
 
 
-# 分析
-
-Concurrency 为 64 时触发了并发上限（max_num_seqs=50），因此后来的请求只能排队
+## 分析
+- Concurrency 为 64 时触发了并发上限（max_num_seqs=50），因此后来的请求只能排队，若增大 gpu_memory_utilization 和 max_num_seqs 可进一步提高总吞吐量
+- 存算皆密集
