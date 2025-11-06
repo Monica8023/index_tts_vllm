@@ -20,6 +20,7 @@ import uuid
 from datetime import datetime
 from loguru import logger
 import sys
+import hashlib
 
 try:
     import oss2  # 阿里云 OSS SDK
@@ -85,10 +86,31 @@ def _validate_audio_file(file_path: str) -> bool:
         return False
 
 
+def md5_encrypt(input_string):
+    """
+    使用MD5算法对字符串进行加密
+
+    参数:
+    input_string (str): 要加密的字符串
+
+    返回:
+    str: 32位小写的MD5加密结果
+    """
+    # 创建一个md5 hash对象
+    md5_hash = hashlib.md5()
+
+    # 更新hash对象，需要将字符串编码为bytes
+    md5_hash.update(input_string.encode('utf-8'))
+
+    # 获取16进制的MD5散列值
+    encrypted_string = md5_hash.hexdigest()
+
+    return encrypted_string
+
 from indextts.infer_vllm import IndexTTS
 
 tts = None
-oss_bucket = None
+oss_bucket = None 
 
 
 def _is_remote_url(path: str) -> bool:
@@ -262,11 +284,15 @@ async def tts_api_url(request: Request):
 
         global tts
         results = []
+        # 缓存同批次内的远程音频 -> 本地临时文件路径
+        remote_audio_cache = {}
+        # 统一清理的临时文件列表
+        cleanup_paths = []
 
         for idx, data in enumerate(payload):
             item_start_time = time.perf_counter()
             try:
-                emo_control_method = data.get("emoControlMethod", 2)
+                emo_control_method = data.get("emoControlMethod", 0)
                 text = data["text"]
                 spk_audio_path = data["voice"]
                 emo_ref_path = data.get("emo_ref_path", None)
@@ -297,15 +323,21 @@ async def tts_api_url(request: Request):
                 else:
                     vec = None
 
-                temp_local_path = None
                 infer_input_path = spk_audio_path
 
                 logger.info(f"[批量TTS] 批次ID: {batch_id}, 索引: {idx}, 开始处理 -> {infer_input_path}")
 
                 if _is_remote_url(spk_audio_path):
-                    temp_local_path = await _download_to_tempfile(spk_audio_path)
-                    infer_input_path = temp_local_path
-                    logger.debug(f"[批量TTS] 批次ID: {batch_id}, 索引: {idx}, 使用下载的临时文件: {infer_input_path}")
+                    # 命中缓存则复用；否则下载并加入缓存与清理列表
+                    if spk_audio_path in remote_audio_cache:
+                        infer_input_path = remote_audio_cache[spk_audio_path]
+                        logger.debug(f"[批量TTS] 批次ID: {batch_id}, 索引: {idx}, 命中缓存: {infer_input_path}")
+                    else:
+                        temp_local_path = await _download_to_tempfile(spk_audio_path)
+                        remote_audio_cache[spk_audio_path] = temp_local_path
+                        cleanup_paths.append(temp_local_path)
+                        infer_input_path = temp_local_path
+                        logger.debug(f"[批量TTS] 批次ID: {batch_id}, 索引: {idx}, 下载并缓存: {infer_input_path}")
                 else:
                     logger.debug(f"[批量TTS] 批次ID: {batch_id}, 索引: {idx}, 使用本地文件: {infer_input_path}")
 
@@ -334,37 +366,35 @@ async def tts_api_url(request: Request):
 
                 oss_object_key, _ = _upload_bytes_to_oss(wav_bytes, object_prefix=oss_prefix_key, file_name=text, ext="wav" )
 
-                if temp_local_path and os.path.exists(temp_local_path):
-                    try:
-                        os.remove(temp_local_path)
-                        logger.debug(f"[批量TTS] 批次ID: {batch_id}, 索引: {idx}, 已删除临时文件: {temp_local_path}")
-                    except Exception as e:
-                        logger.warning(f"[批量TTS] 批次ID: {batch_id}, 索引: {idx}, 删除临时文件失败: {e}")
-
                 item_time = time.perf_counter() - item_start_time
                 logger.info(f"[批量TTS] 批次ID: {batch_id}, 索引: {idx}, 处理成功，总耗时: {item_time:.2f}秒")
+                fixed_redis_index = f"{redis_prefix}:{md5_encrypt(text)}"
+                logger.info(f"[批量TTS] 批次ID: {batch_id}, 索引: {idx}, redis索引: {fixed_redis_index}")
 
                 results.append({
                     "index": idx,
                     "status": "success",
                     "ossUrl": oss_object_key,
-                    "redisIndex": redis_prefix,
+                    "redisIndex": fixed_redis_index,
                 })
 
             except Exception as item_ex:
                 item_time = time.perf_counter() - item_start_time
                 logger.error(f"[批量TTS] 批次ID: {batch_id}, 索引: {idx}, 处理失败，耗时: {item_time:.2f}秒, 错误: {str(item_ex)}")
-                try:
-                    if 'temp_local_path' in locals() and temp_local_path and os.path.exists(temp_local_path):
-                        os.remove(temp_local_path)
-                except Exception:
-                    pass
                 results.append({
                     "index": idx,
                     "status": "error",
                     "error": str(item_ex),
-                    "redisIndex": data.get("redisPrefix", None),
                 })
+
+        # 统一清理本批次下载的临时文件
+        for p in cleanup_paths:
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+                    logger.debug(f"[批量TTS] 批次ID: {batch_id}, 已清理临时文件: {p}")
+            except Exception as e:
+                logger.warning(f"[批量TTS] 批次ID: {batch_id}, 清理临时文件失败: {p}, 错误: {e}")
 
         total_time = time.perf_counter() - start_time
         success_count = sum(1 for r in results if r.get("status") == "success")
