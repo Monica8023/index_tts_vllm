@@ -36,18 +36,18 @@ def setup_logger(log_dir: str = "log"):
     """配置日志输出到指定目录"""
     # 创建日志目录
     os.makedirs(log_dir, exist_ok=True)
-    
+
     # 移除默认的控制台处理器（如果需要自定义格式）
     logger.remove()
-    
+
     # 添加控制台输出（带颜色）
     logger.add(
         sys.stderr,
         format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-        level="INFO",
+        level="DEBUG",
         colorize=True,
     )
-    
+
     # 添加文件输出 - 所有日志
     logger.add(
         os.path.join(log_dir, "api_server_{time:YYYY-MM-DD}.log"),
@@ -58,7 +58,7 @@ def setup_logger(log_dir: str = "log"):
         compression="zip",  # 压缩旧日志
         encoding="utf-8",
     )
-    
+
     # 添加文件输出 - 仅错误日志
     logger.add(
         os.path.join(log_dir, "error_{time:YYYY-MM-DD}.log"),
@@ -69,21 +69,8 @@ def setup_logger(log_dir: str = "log"):
         compression="zip",
         encoding="utf-8",
     )
-    
+
     logger.info(f"日志系统初始化完成，日志目录: {os.path.abspath(log_dir)}")
-
-
-def _validate_audio_file(file_path: str) -> bool:
-    """验证音频文件是否有效"""
-    try:
-        import soundfile as sf
-        # 尝试读取文件信息
-        info = sf.info(file_path)
-        logger.info(f"[验证] 音频文件信息 - 采样率: {info.samplerate}, 时长: {info.duration:.2f}秒, 通道数: {info.channels}")
-        return True
-    except Exception as e:
-        logger.error(f"[验证] 音频文件无效: {e}")
-        return False
 
 
 def md5_encrypt(input_string):
@@ -107,10 +94,41 @@ def md5_encrypt(input_string):
 
     return encrypted_string
 
+
+def _validate_audio_file(file_path: str) -> bool:
+    try:
+        import soundfile as sf
+        info = sf.info(file_path)
+        logger.info(
+            f"[验证] (soundfile) {file_path} | sr={info.samplerate}, dur={info.duration:.2f}s, ch={info.channels}")
+        return True
+    except Exception as e1:
+        logger.warning(f"[验证] soundfile 失败：{e1}")
+
+    try:
+        import torchaudio
+        info = torchaudio.info(file_path)
+        logger.info(
+            f"[验证] (torchaudio) {file_path} | sr={info.sample_rate}, ch={info.num_channels}, frames={info.num_frames}")
+        return True
+    except Exception as e2:
+        logger.warning(f"[验证] torchaudio 失败：{e2}")
+
+    try:
+        import librosa
+        y, sr = librosa.load(file_path, sr=None, mono=False)
+        dur = (y.shape[-1] / sr) if y is not None else 0
+        logger.info(f"[验证] (librosa) {file_path} | sr={sr}, dur={dur:.2f}s, shape={getattr(y, 'shape', None)}")
+        return True
+    except Exception as e3:
+        logger.error(f"[验证] 全部后端均失败：{e3}")
+        return False
+
+
 from indextts.infer_vllm import IndexTTS
 
 tts = None
-oss_bucket = None 
+oss_bucket = None
 
 
 def _is_remote_url(path: str) -> bool:
@@ -176,12 +194,13 @@ def _init_oss_by_config(config: dict):
     oss_bucket = oss2.Bucket(auth, endpoint, bucket_name)
 
 
-
-def _upload_bytes_to_oss(content: bytes, object_prefix: str = "tts/outputs", file_name: str = "output.wav", ext: str = "wav") -> tuple:
+def _upload_bytes_to_oss(content: bytes, object_prefix: str = "tts/outputs", file_name: str = "output.wav",
+                         ext: str = "wav") -> tuple:
     global oss_bucket
     if oss_bucket is None or oss2 is None:
         logger.warning("[OSS] OSS未初始化，跳过上传")
         return (None, None)
+    file_name = md5_encrypt(file_name)
     object_prefix = f"{object_prefix}/{file_name}.{ext}"
     logger.info(f"[OSS] 开始上传音频到OSS: {object_prefix}")
     oss_bucket.put_object(object_prefix, content)
@@ -270,7 +289,7 @@ async def tts_api_url(request: Request):
     start_time = time.perf_counter()
     batch_id = uuid.uuid4().hex[:8]
     logger.info(f"[批量TTS] 批次ID: {batch_id}, 开始处理请求")
-    
+
     try:
         payload = await request.json()
         if not isinstance(payload, list):
@@ -364,7 +383,8 @@ async def tts_api_url(request: Request):
                     sf.write(wav_buffer, wav, sr, format='WAV')
                     wav_bytes = wav_buffer.getvalue()
 
-                oss_object_key, _ = _upload_bytes_to_oss(wav_bytes, object_prefix=oss_prefix_key, file_name=text, ext="wav" )
+                oss_object_key, _ = _upload_bytes_to_oss(wav_bytes, object_prefix=oss_prefix_key, file_name=text,
+                                                         ext="wav")
 
                 item_time = time.perf_counter() - item_start_time
                 logger.info(f"[批量TTS] 批次ID: {batch_id}, 索引: {idx}, 处理成功，总耗时: {item_time:.2f}秒")
@@ -380,7 +400,8 @@ async def tts_api_url(request: Request):
 
             except Exception as item_ex:
                 item_time = time.perf_counter() - item_start_time
-                logger.error(f"[批量TTS] 批次ID: {batch_id}, 索引: {idx}, 处理失败，耗时: {item_time:.2f}秒, 错误: {str(item_ex)}")
+                logger.error(
+                    f"[批量TTS] 批次ID: {batch_id}, 索引: {idx}, 处理失败，耗时: {item_time:.2f}秒, 错误: {str(item_ex)}")
                 results.append({
                     "index": idx,
                     "status": "error",
@@ -399,7 +420,8 @@ async def tts_api_url(request: Request):
         total_time = time.perf_counter() - start_time
         success_count = sum(1 for r in results if r.get("status") == "success")
         error_count = len(results) - success_count
-        logger.info(f"[批量TTS] 批次ID: {batch_id}, 全部完成, 总数: {len(results)}, 成功: {success_count}, 失败: {error_count}, 总耗时: {total_time:.2f}秒")
+        logger.info(
+            f"[批量TTS] 批次ID: {batch_id}, 全部完成, 总数: {len(results)}, 成功: {success_count}, 失败: {error_count}, 总耗时: {total_time:.2f}秒")
 
         return JSONResponse(
             status_code=200,
