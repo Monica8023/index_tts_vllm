@@ -259,8 +259,8 @@ class IndexTTS2:
             # assert emo_alpha == 1.0
             if emo_text is None:
                 emo_text = text
-            emo_dict, content = await self.qwen_emo.inference(emo_text)
-            # logger.info(emo_dict)
+            emo_dict, content = self.qwen_emo.inference(emo_text)
+            print(emo_dict)
             emo_vector = list(emo_dict.values())
 
         if emo_vector is not None:
@@ -465,7 +465,7 @@ class IndexTTS2:
                                                                    inference_cfg_rate=inference_cfg_rate)
                     vc_target = vc_target[:, :, ref_mel.size(-1):]
                     # 在 Mel-Spectrogram 层面调整语速（支持 0.5-2.0 倍速）
-                    speed_factor = 2.0
+                    speed_factor = 1.0
                     if speed_factor != 1.0:
                         # vc_target shape: [batch, n_mels, time]
                         new_time = int(vc_target.shape[-1] / speed_factor)
