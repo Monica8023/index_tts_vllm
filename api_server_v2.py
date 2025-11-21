@@ -29,7 +29,6 @@ except Exception:
 
 from indextts.infer_vllm_v2 import IndexTTS2
 
-tts = None
 
 
 def setup_logger(log_dir: str = "log"):
@@ -96,36 +95,37 @@ def md5_encrypt(input_string):
 
 
 def _validate_audio_file(file_path: str) -> bool:
+    """多后端音频验证：soundfile -> torchaudio -> librosa，支持 webm/mp3 等常见格式。"""
+    # 1) soundfile（快速，识别 WAV/FLAC/OGG 等）
     try:
         import soundfile as sf
         info = sf.info(file_path)
-        logger.info(
-            f"[验证] (soundfile) {file_path} | sr={info.samplerate}, dur={info.duration:.2f}s, ch={info.channels}")
+        logger.info(f"[验证] (soundfile) {file_path} | sr={info.samplerate}, dur={info.duration:.2f}s, ch={info.channels}")
         return True
     except Exception as e1:
-        logger.warning(f"[验证] soundfile 失败：{e1}")
-
+        logger.debug(f"[验证] soundfile 失败: {str(e1)[:160]}")
+    # 2) torchaudio（依赖系统后端，支持 webm/mp3/aac 等）
     try:
         import torchaudio
         info = torchaudio.info(file_path)
-        logger.info(
-            f"[验证] (torchaudio) {file_path} | sr={info.sample_rate}, ch={info.num_channels}, frames={info.num_frames}")
+        logger.info(f"[验证] (torchaudio) {file_path} | sr={info.sample_rate}, ch={info.num_channels}, frames={info.num_frames}")
         return True
     except Exception as e2:
-        logger.warning(f"[验证] torchaudio 失败：{e2}")
-
+        logger.debug(f"[验证] torchaudio 失败: {str(e2)[:160]}")
+    # 3) librosa（经由 audioread/ffmpeg 再兜底）
     try:
         import librosa
-        y, sr = librosa.load(file_path, sr=None, mono=False)
-        dur = (y.shape[-1] / sr) if y is not None else 0
-        logger.info(f"[验证] (librosa) {file_path} | sr={sr}, dur={dur:.2f}s, shape={getattr(y, 'shape', None)}")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            duration = librosa.get_duration(path=file_path, backend="audioread")
+        y, sr = librosa.load(file_path, sr=None, mono=False, duration=0.1)
+        logger.info(f"[验证] (librosa) {file_path} | sr={sr}, dur={duration:.2f}s, shape={getattr(y, 'shape', None)}")
         return True
     except Exception as e3:
-        logger.error(f"[验证] 全部后端均失败：{e3}")
+        logger.error(f"[验证] 全部后端均失败，无法识别为有效音频: {str(e3)[:200]}")
         return False
 
 
-from indextts.infer_vllm import IndexTTS
 
 tts = None
 oss_bucket = None
@@ -201,7 +201,7 @@ def _upload_bytes_to_oss(content: bytes, object_prefix: str = "tts/outputs", fil
         logger.warning("[OSS] OSS未初始化，跳过上传")
         return (None, None)
     file_name = md5_encrypt(file_name)
-    object_prefix = f"{object_prefix}/{file_name}.{ext}"
+    object_prefix = f"{object_prefix}{file_name}.{ext}"
     logger.info(f"[OSS] 开始上传音频到OSS: {object_prefix}")
     oss_bucket.put_object(object_prefix, content)
     logger.info(f"[OSS] 上传完成: {object_prefix}")
@@ -218,6 +218,7 @@ async def lifespan(app: FastAPI):
         model_dir=args.model_dir,
         is_fp16=args.is_fp16,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        qwenemo_gpu_memory_utilization=args.qwenemo_gpu_memory_utilization,
     )
 
     # 初始化 OSS（可选）——从常见路径加载配置
@@ -266,6 +267,7 @@ async def health_check():
         return JSONResponse(
             status_code=503,
             content={
+                "code":500,
                 "status": "unhealthy",
                 "message": "TTS model not initialized"
             }
@@ -274,6 +276,7 @@ async def health_check():
     return JSONResponse(
         status_code=200,
         content={
+            "code":200,
             "status": "healthy",
             "message": "Service is running",
             "timestamp": time.time()
@@ -319,9 +322,10 @@ async def tts_api_url(request: Request):
                 emo_vec = data.get("emoVec", [0] * 8)
                 emo_text = data.get("emo_text", None)
                 emo_random = data.get("emo_random", False)
-                max_text_tokens_per_sentence = int(data.get("max_text_tokens_per_sentence", 120))
+                max_text_tokens_per_sentence = int(data.get("max_text_tokens_per_sentence", 150))
                 oss_prefix_key = data.get("ossPrefix", None)
                 redis_prefix = data.get("redisPrefix", None)
+                speed_factor = data.get("speedFactor", 1.0)
 
                 if type(emo_control_method) is not int:
                     emo_control_method = emo_control_method.value
@@ -364,6 +368,7 @@ async def tts_api_url(request: Request):
                     raise ValueError(f"音频文件无效或损坏: {infer_input_path}")
 
                 inference_start_time = time.perf_counter()
+                print(f"speedFactor:{speed_factor}")
                 sr, wav = await tts.infer(
                     spk_audio_prompt=infer_input_path,
                     text=text,
@@ -375,6 +380,7 @@ async def tts_api_url(request: Request):
                     emo_text=emo_text,
                     use_random=emo_random,
                     max_text_tokens_per_sentence=max_text_tokens_per_sentence,
+                    speed_factor = speed_factor,
                 )
                 inference_time = time.perf_counter() - inference_start_time
                 logger.info(f"[批量TTS] 批次ID: {batch_id}, 索引: {idx}, 推理完成，耗时: {inference_time:.2f}秒")
@@ -453,6 +459,7 @@ if __name__ == "__main__":
                         help="Model checkpoints directory")
     parser.add_argument("--is_fp16", action="store_true", default=False, help="Fp16 infer")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.25)
+    parser.add_argument("--qwenemo_gpu_memory_utilization", type=float, default=0.10)
     parser.add_argument("--verbose", action="store_true", default=False, help="Enable verbose mode")
     parser.add_argument("--log_dir", type=str, default="log", help="日志文件目录")
     args = parser.parse_args()
