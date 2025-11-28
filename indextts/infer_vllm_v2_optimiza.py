@@ -5,18 +5,20 @@ import time
 import traceback
 from typing import List
 import uuid
+import asyncio
+import threading
+import queue
+from concurrent.futures import Future
 
 import librosa
 import torch
 import torchaudio
-# from torch.nn.utils.rnn import pad_sequence
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from transformers import SeamlessM4TFeatureExtractor
 from transformers import AutoTokenizer
 from modelscope import AutoModelForCausalLM
 import safetensors
-from loguru import logger
 
 import warnings
 
@@ -42,19 +44,79 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.v1.engine.async_llm import AsyncLLM
 
 
+class BigVGANBatcher:
+    """异步聚合多个 BigVGAN 请求，实现跨请求批量推理。"""
+
+    def __init__(self, bigvgan, max_batch_size: int = 4, max_wait_ms: float = 5.0):
+        self.bigvgan = bigvgan
+        self.max_batch_size = max_batch_size
+        self.max_wait = max_wait_ms / 1000.0
+        self.queue: "queue.Queue[tuple[torch.Tensor, Future]]" = queue.Queue()
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def submit(self, vc_target: torch.Tensor) -> Future:
+        fut: Future = Future()
+        self.queue.put((vc_target, fut))
+        return fut
+
+    def _worker(self) -> None:
+        while True:
+            vc_target, fut = self.queue.get()
+            batch = [(vc_target, fut)]
+            start_time = time.perf_counter()
+
+            # Try to collect more requests to form a batch.
+            # 等待极短时间收集更多请求，提升 vocoder 的批量吞吐
+            while len(batch) < self.max_batch_size:
+                timeout = self.max_wait - (time.perf_counter() - start_time)
+                if timeout <= 0:
+                    break
+                try:
+                    item = self.queue.get(timeout=timeout)
+                    batch.append(item)
+                except queue.Empty:
+                    break
+
+            vc_tensors = [item[0] for item in batch]
+            futures = [item[1] for item in batch]
+            lengths = [v.shape[-1] for v in vc_tensors]
+            T_max = max(lengths)
+
+            # Pad along time dimension to the max length in this mini-batch.
+            padded = []
+            for v in vc_tensors:
+                if v.shape[-1] < T_max:
+                    pad = T_max - v.shape[-1]
+                    padded.append(F.pad(v, (0, pad)))
+                else:
+                    padded.append(v)
+
+            mels_batch = torch.cat(padded, dim=0)
+
+            with torch.no_grad():
+                wav_batch = self.bigvgan(mels_batch.float())
+
+            if wav_batch.dim() == 2:
+                wav_batch = wav_batch.unsqueeze(1)
+
+            _, _, T_audio = wav_batch.shape
+            upsample = T_audio // T_max if T_max > 0 else 0
+
+            for idx, (length, f) in enumerate(zip(lengths, futures)):
+                if upsample > 0:
+                    t_len = int(length * upsample)
+                    wav_i = wav_batch[idx:idx + 1, :, :t_len]
+                else:
+                    wav_i = wav_batch[idx:idx + 1]
+                f.set_result(wav_i)
+
+
+
 class IndexTTS2:
     def __init__(
-            self, model_dir="checkpoints", is_fp16=False, device=None, use_cuda_kernel=None,
-            gpu_memory_utilization=0.25, qwenemo_gpu_memory_utilization=0.10
+        self, model_dir="checkpoints", is_fp16=False, device=None, use_cuda_kernel=None, gpu_memory_utilization=0.25, qwenemo_gpu_memory_utilization=0.10
     ):
-        """
-        Args:
-            cfg_path (str): path to the config file.
-            model_dir (str): path to the model directory.
-            is_fp16 (bool): whether to use fp16.
-            device (str): device to use (e.g., 'cuda:0', 'cpu'). If None, it will be set automatically based on the availability of CUDA or MPS.
-            use_cuda_kernel (None | bool): whether to use BigVGan custom fused activation CUDA kernel, only for CUDA device.
-        """
         if device is not None:
             self.device = device
             self.is_fp16 = False if device == "cpu" else is_fp16
@@ -65,13 +127,13 @@ class IndexTTS2:
             self.use_cuda_kernel = use_cuda_kernel is None or use_cuda_kernel
         elif hasattr(torch, "mps") and torch.backends.mps.is_available():
             self.device = "mps"
-            self.is_fp16 = False  # Use float16 on MPS is overhead than float32
+            self.is_fp16 = False # Use float16 on MPS is overhead than float32
             self.use_cuda_kernel = False
         else:
             self.device = "cpu"
             self.is_fp16 = False
             self.use_cuda_kernel = False
-            logger.info(">> Be patient, it may take a while to run in CPU mode.")
+            print(">> Be patient, it may take a while to run in CPU mode.")
 
         cfg_path = os.path.join(model_dir, "config.yaml")
         self.cfg = OmegaConf.load(cfg_path)
@@ -103,7 +165,7 @@ class IndexTTS2:
         # else:
         #     self.gpt.eval()
         self.gpt.eval()
-        logger.info(f">> GPT weights restored from: {self.gpt_path}")
+        print(">> GPT weights restored from:", self.gpt_path)
 
         if self.use_cuda_kernel:
             # preload the CUDA kernel for BigVGAN
@@ -111,10 +173,10 @@ class IndexTTS2:
                 from indextts.BigVGAN.alias_free_activation.cuda import load
 
                 anti_alias_activation_cuda = load.load()
-                logger.info(f">> Preload custom CUDA kernel for BigVGAN {anti_alias_activation_cuda}")
+                print(">> Preload custom CUDA kernel for BigVGAN", anti_alias_activation_cuda)
             except Exception as ex:
                 traceback.print_exc()
-                logger.info(">> Failed to load custom CUDA kernel for BigVGAN. Falling back to torch.")
+                print(">> Failed to load custom CUDA kernel for BigVGAN. Falling back to torch.")
                 self.use_cuda_kernel = False
 
         self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained(
@@ -131,11 +193,13 @@ class IndexTTS2:
         self.semantic_std = self.semantic_std.to(self.device)
 
         semantic_codec = build_semantic_codec(self.cfg.semantic_codec)
+        # semantic_code_ckpt = hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors", cache_dir=os.path.join(self.model_dir, "semantic_codec"))
         semantic_code_ckpt = os.path.join(self.model_dir, "semantic_codec/model.safetensors")
+        # print("semantic_code_ckpt", semantic_code_ckpt)
         safetensors.torch.load_model(semantic_codec, semantic_code_ckpt)
         self.semantic_codec = semantic_codec.to(self.device)
         self.semantic_codec.eval()
-        logger.info('>> semantic_codec weights restored from: {}'.format(semantic_code_ckpt))
+        print('>> semantic_codec weights restored from: {}'.format(semantic_code_ckpt))
 
         s2mel_path = os.path.join(self.model_dir, self.cfg.s2mel_checkpoint)
         s2mel = MyModel(self.cfg.s2mel, use_gpt_latent=True)
@@ -150,7 +214,7 @@ class IndexTTS2:
         self.s2mel = s2mel.to(self.device)
         self.s2mel.models['cfm'].estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
         self.s2mel.eval()
-        logger.info(f">> s2mel weights restored from: {s2mel_path}")
+        print(">> s2mel weights restored from:", s2mel_path)
 
         # load campplus_model
         # campplus_ckpt_path = hf_hub_download(
@@ -161,7 +225,7 @@ class IndexTTS2:
         campplus_model.load_state_dict(torch.load(campplus_ckpt_path, map_location="cpu"))
         self.campplus_model = campplus_model.to(self.device)
         self.campplus_model.eval()
-        logger.info(f">> campplus_model weights restored from: {campplus_ckpt_path}")
+        print(">> campplus_model weights restored from:", campplus_ckpt_path)
 
         bigvgan_name = self.cfg.vocoder.name
         # self.bigvgan = bigvgan.BigVGAN.from_pretrained(bigvgan_name, use_cuda_kernel=False, cache_dir=os.path.join(self.model_dir, "bigvgan"))
@@ -169,14 +233,17 @@ class IndexTTS2:
         self.bigvgan = self.bigvgan.to(self.device)
         self.bigvgan.remove_weight_norm()
         self.bigvgan.eval()
-        logger.info(f">> bigvgan weights restored from: {bigvgan_name}")
+        print(">> bigvgan weights restored from:", bigvgan_name)
+        # Cross-request BigVGAN batcher: keeps diffusion_steps=25 unchanged, only batches vocoder calls.
+        # 复用单个 BigVGAN 实例，通过批处理器跨请求拼接推理，减少 vocoder 启动次数
+        self.bigvgan_batcher = BigVGANBatcher(self.bigvgan, max_batch_size=4, max_wait_ms=5.0)
 
         self.bpe_path = os.path.join(self.model_dir, "bpe.model")  # self.cfg.dataset["bpe_model"]
         self.normalizer = TextNormalizer()
         self.normalizer.load()
-        logger.info(">> TextNormalizer loaded")
+        print(">> TextNormalizer loaded")
         self.tokenizer = TextTokenizer(self.bpe_path, self.normalizer)
-        logger.info(f">> bpe model loaded from: {self.bpe_path}")
+        print(">> bpe model loaded from:", self.bpe_path)
 
         emo_matrix = torch.load(os.path.join(self.model_dir, self.cfg.emo_matrix))
         self.emo_matrix = emo_matrix.to(self.device)
@@ -222,22 +289,18 @@ class IndexTTS2:
         if not wavs or interval_silence <= 0:
             return wavs
 
-        # 若整体时长极短（例如 2~3 个字），直接返回，避免人为塞静音
         total_duration_sec = sum(wav.size(-1) for wav in wavs) / sampling_rate
-        #  若整体时长过短  当前设置1.2s，则直接返回
-        if total_duration_sec < 1.2:
-            logger.debug(f">> Skip silence insertion for ultra-short utterance ({total_duration_sec:.2f}s)")
+        if total_duration_sec < 0.8:
+            print(f">> Skip silence insertion for ultra-short utterance ({total_duration_sec:.2f}s)")
             return wavs
 
         # get channel_size
         channel_size = wavs[0].size(0)
-        # 根据当前文本平均时长动态压缩停顿，避免短文本被静音“拉长”
         avg_sentence_sec = sum(wav.size(-1) for wav in wavs) / (len(wavs) * sampling_rate)
         adaptive_interval = interval_silence
         if avg_sentence_sec < 1.2 and interval_silence > 60:
-            # 将间隔按比例缩短，但至少保留 50ms，防止完全无停顿
             adaptive_interval = max(50, int(interval_silence * (avg_sentence_sec / 1.2)))
-            logger.debug(
+            print(
                 f">> Adaptive silence: origin={interval_silence}ms, adjusted={adaptive_interval}ms, avg_sentence_sec={avg_sentence_sec:.2f}"
             )
         # get silence tensor
@@ -257,8 +320,8 @@ class IndexTTS2:
         """针对短句动态调整 target_lengths 的倍率，避免 1-2 秒文本被拉长"""
         max_len = code_lens_tensor.max().item()
         # 对极短文本（如两个字）使用更保守的扩展
-        if max_len <= 16:  # 约1-2个字
-            return 1.15
+        if max_len <= 12:  # 约1-2个字
+            return 1.10
         if max_len <= 32:
             return 1.25
         if max_len <= 64:
@@ -270,11 +333,11 @@ class IndexTTS2:
         return 1.72
 
     async def infer(self, spk_audio_prompt, text, output_path,
-                    emo_audio_prompt=None, emo_alpha=1.0,
-                    emo_vector=None,
-                    use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-                    verbose=False, max_text_tokens_per_sentence=150, speed_factor=1.0, volume_gain=1.0, **generation_kwargs):
-        logger.info(">> start inference...")
+              emo_audio_prompt=None, emo_alpha=1.0,
+              emo_vector=None,
+              use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
+              verbose=False, max_text_tokens_per_sentence=120, volume_gain=1.0, **generation_kwargs):
+        print(">> start inference...")
         start_time = time.perf_counter()
 
         if use_emo_text:
@@ -285,7 +348,7 @@ class IndexTTS2:
             if emo_text is None:
                 emo_text = text
             emo_dict, content = await self.qwen_emo.inference(emo_text)
-            # logger.info(emo_dict)
+            print(emo_dict)
             emo_vector = list(emo_dict.values())
 
         if emo_vector is not None:
@@ -304,27 +367,35 @@ class IndexTTS2:
         audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
         audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
 
-        inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
-        input_features = inputs["input_features"]
-        attention_mask = inputs["attention_mask"]
-        input_features = input_features.to(self.device)
-        attention_mask = attention_mask.to(self.device)
-        spk_cond_emb = self.get_emb(input_features, attention_mask)
+        # 以原始参考音频路径作为缓存 key，避免重复提取 speaker embedding
+        cache_key = spk_audio_prompt
+        cached = self.speaker_dict.get(cache_key)
+        if cached is not None:
+            spk_cond_emb = cached["spk_cond_emb"]
+        else:
+            inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
+            input_features = inputs["input_features"]
+            attention_mask = inputs["attention_mask"]
+            input_features = input_features.to(self.device)
+            attention_mask = attention_mask.to(self.device)
+            spk_cond_emb = self.get_emb(input_features, attention_mask)
+            # Cache speaker embedding for reuse across requests with same prompt
+            self.speaker_dict[cache_key] = {"spk_cond_emb": spk_cond_emb}
 
         _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
         ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
         ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
         feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(ref_mel.device),
-                                                 num_mel_bins=80,
-                                                 dither=0,
-                                                 sample_frequency=16000)
+                                                    num_mel_bins=80,
+                                                    dither=0,
+                                                    sample_frequency=16000)
         feat = feat - feat.mean(dim=0, keepdim=True)  # feat2另外一个滤波器能量组特征[922, 80]
         style = self.campplus_model(feat.unsqueeze(0))  # 参考音频的全局style2[1,192]
 
         prompt_condition = self.s2mel.models['length_regulator'](S_ref,
-                                                                 ylens=ref_target_lengths,
-                                                                 n_quantizers=3,
-                                                                 f0=None)[0]
+                                                                    ylens=ref_target_lengths,
+                                                                    n_quantizers=3,
+                                                                    f0=None)[0]
 
         if emo_vector is not None:
             weight_vector = torch.tensor(emo_vector).to(self.device)
@@ -346,7 +417,6 @@ class IndexTTS2:
         emo_input_features = emo_input_features.to(self.device)
         emo_attention_mask = emo_attention_mask.to(self.device)
         emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
-        speed_factor = speed_factor
 
         text_tokens_list = self.tokenizer.tokenize(text)
         sentences = self.tokenizer.split_sentences(text_tokens_list, max_text_tokens_per_sentence)
@@ -358,13 +428,99 @@ class IndexTTS2:
 
         sampling_rate = 22050
 
-        wavs = []
-        gpt_gen_time = 0
-        gpt_forward_time = 0
-        s2mel_time = 0
-        bigvgan_time = 0
-        has_warned = False
-        for sent in sentences:
+        loop = asyncio.get_running_loop()
+
+        def _process_sentence_after_gpt(text_tokens, codes, speech_conditioning_latent, emovec):
+            gpt_forward = 0.0
+            local_s2mel = 0.0
+            local_bigvgan = 0.0
+
+            with torch.no_grad():
+                # 计算 code_lens，并裁剪 codes
+                code_lens = []
+                for code in codes:
+                    if self.stop_mel_token not in code:
+                        code_len = len(code)
+                    else:
+                        len_ = (code == self.stop_mel_token).nonzero(as_tuple=False)[0] + 1
+                        code_len = len_ - 1
+                    code_lens.append(code_len)
+                codes_local = codes[:, :code_len]
+                code_lens_tensor = torch.LongTensor(code_lens).to(self.device)
+
+                if verbose:
+                    print(codes_local, type(codes_local))
+                    print(f"fix codes shape: {codes_local.shape}, codes type: {codes_local.dtype}")
+                    print(f"code len: {code_lens_tensor}")
+
+                m_start_time = time.perf_counter()
+                use_speed = torch.zeros(spk_cond_emb.size(0), device=spk_cond_emb.device).long()
+                latent = self.gpt(
+                    speech_conditioning_latent,
+                    text_tokens,
+                    torch.tensor([text_tokens.shape[-1]], device=text_tokens.device),
+                    codes_local,
+                    torch.tensor([codes_local.shape[-1]], device=text_tokens.device),
+                    emo_cond_emb,
+                    cond_mel_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
+                    emo_cond_mel_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
+                    emo_vec=emovec,
+                    use_speed=use_speed,
+                )
+                gpt_forward += time.perf_counter() - m_start_time
+
+                dtype = self.dtype
+                use_amp = dtype is not None
+                device_type = text_tokens.device.type
+                with torch.amp.autocast(device_type, enabled=use_amp, dtype=dtype):
+                    m_start_time = time.perf_counter()
+                    # 对极短文本减少扩散步数，避免过度生成
+                    diffusion_steps = 15 if code_lens_tensor.max().item() <= 16 else 25
+                    # 对极短文本降低CFG率，减少过度扩展
+                    inference_cfg_rate = 0.5 if code_lens_tensor.max().item() <= 16 else 0.7
+                    latent = self.s2mel.models['gpt_layer'](latent)
+                    S_infer = self.semantic_codec.quantizer.vq2emb(codes_local.unsqueeze(1))
+                    S_infer = S_infer.transpose(1, 2)
+                    S_infer = S_infer + latent
+                    scale = self._calc_dynamic_target_scale(code_lens_tensor)
+                    # 对极短文本使用更精确的最小长度控制
+                    min_extra = 2 if code_lens_tensor.max().item() <= 16 else 4
+                    target_lengths = (code_lens_tensor * scale).long().clamp(min=code_lens_tensor + min_extra)
+
+                    cond = self.s2mel.models['length_regulator'](S_infer,
+                                                                 ylens=target_lengths,
+                                                                 n_quantizers=3,
+                                                                 f0=None)[0]
+                    cat_condition = torch.cat([prompt_condition, cond], dim=1)
+                    vc_target = self.s2mel.models['cfm'].inference(
+                        cat_condition,
+                        torch.LongTensor([cat_condition.size(1)]).to(cond.device),
+                        ref_mel,
+                        style,
+                        None,
+                        diffusion_steps,
+                        inference_cfg_rate=inference_cfg_rate,
+                    )
+                    vc_target = vc_target[:, :, ref_mel.size(-1):]
+                    local_s2mel += time.perf_counter() - m_start_time
+
+                    # BigVGAN cross-request batching
+                    m_start_time = time.perf_counter()
+                    fut = self.bigvgan_batcher.submit(vc_target)
+                    wav = fut.result()
+                    if verbose:
+                        print(wav.shape)
+                    local_bigvgan += time.perf_counter() - m_start_time
+                    wav = wav.squeeze(1)
+
+            wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
+            if verbose:
+                print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
+
+            return wav, gpt_forward, local_s2mel, local_bigvgan
+
+        # 多句并行处理流水线：句级并发 GPT 采样 + 线程池中的 s2mel/BigVGAN
+        async def _process_single_sentence_pipeline(sent):
             text_tokens = self.tokenizer.convert_tokens_to_ids(sent)
             text_tokens = torch.tensor(text_tokens, dtype=torch.int32, device=self.device).unsqueeze(0)
 
@@ -382,12 +538,11 @@ class IndexTTS2:
                     emo_cond_emb,
                     torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
                     torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
-                    alpha=emo_alpha
+                    alpha=emo_alpha,
                 )
 
                 if emo_vector is not None:
                     emovec = emovec_mat + (1 - torch.sum(weight_vector)) * emovec
-                    # emovec = emovec_mat
 
                 codes, speech_conditioning_latent = await self.gpt.inference_speech(
                     spk_cond_emb,
@@ -397,108 +552,39 @@ class IndexTTS2:
                     emo_cond_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
                     emo_vec=emovec,
                 )
-                gpt_gen_time += time.perf_counter() - m_start_time
-                # if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
-                #     warnings.warn(
-                #         f"WARN: generation stopped due to exceeding `max_mel_tokens` ({self.cfg.gpt.max_mel_tokens}). "
-                #         f"Current output shape: {codes.shape}. "
-                #         f"Input text tokens: {text_tokens.shape[1]}. "
-                #         f"Consider reducing `max_text_tokens_per_sentence`({max_text_tokens_per_sentence}) or increasing `max_mel_tokens`.",
-                #         category=RuntimeWarning
-                #     )
-                #     has_warned = True
 
-                # codes = torch.tensor(codes, dtype=torch.long, device=self.device).unsqueeze(0)
-                code_lens = torch.tensor([codes.shape[-1]], device=codes.device, dtype=codes.dtype)
+            local_gpt_gen = time.perf_counter() - m_start_time
 
-                code_lens = []
-                for code in codes:
-                    if self.stop_mel_token not in code:
-                        # code_lens.append(len(code))
-                        code_len = len(code)
-                    else:
-                        len_ = (code == self.stop_mel_token).nonzero(as_tuple=False)[0] + 1
-                        code_len = len_ - 1
-                    code_lens.append(code_len)
-                codes = codes[:, :code_len]
-                code_lens = torch.LongTensor(code_lens)
-                code_lens = code_lens.to(self.device)
-                if verbose:
-                    print(codes, type(codes))
-                    print(f"fix codes shape: {codes.shape}, codes type: {codes.dtype}")
-                    print(f"code len: {code_lens}")
+            # 将 GPT 前向 + s2mel + BigVGAN 放入线程池执行（内部使用 BigVGANBatcher 做跨请求 batch）
+            wav, local_gpt_forward, local_s2mel, local_bigvgan = await loop.run_in_executor(
+                None,
+                _process_sentence_after_gpt,
+                text_tokens,
+                codes,
+                speech_conditioning_latent,
+                emovec,
+            )
 
-                m_start_time = time.perf_counter()
-                use_speed = torch.zeros(spk_cond_emb.size(0)).to(spk_cond_emb.device).long()
-                # latent = self.gpt(speech_conditioning_latent, text_tokens,
-                #                 torch.tensor([text_tokens.shape[-1]], device=text_tokens.device), codes,
-                #                 code_lens*self.gpt.mel_length_compression,
-                #                 cond_mel_lengths=torch.tensor([speech_conditioning_latent.shape[-1]], device=text_tokens.device),
-                #                 return_latent=True, clip_inputs=False)
-                latent = self.gpt(
-                    speech_conditioning_latent,
-                    text_tokens,
-                    torch.tensor([text_tokens.shape[-1]], device=text_tokens.device),
-                    codes,
-                    torch.tensor([codes.shape[-1]], device=text_tokens.device),
-                    emo_cond_emb,
-                    cond_mel_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
-                    emo_cond_mel_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
-                    emo_vec=emovec,
-                    use_speed=use_speed,
-                )
-                gpt_forward_time += time.perf_counter() - m_start_time
+            return wav.cpu(), local_gpt_gen, local_gpt_forward, local_s2mel, local_bigvgan
 
-                dtype = None
-                with torch.amp.autocast(text_tokens.device.type, enabled=dtype is not None, dtype=dtype):
-                    m_start_time = time.perf_counter()
-                    # 对极短文本减少扩散步数，避免过度生成
-                    diffusion_steps = 15 if code_lens.max().item() <= 16 else 25
-                    # 对极短文本降低CFG率，减少过度扩展
-                    inference_cfg_rate = 0.5 if code_lens.max().item() <= 16 else 0.7
-                    latent = self.s2mel.models['gpt_layer'](latent)
-                    S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
-                    S_infer = S_infer.transpose(1, 2)
-                    S_infer = S_infer + latent
-                    scale = self._calc_dynamic_target_scale(code_lens)
-                    # 对极短文本使用更精确的最小长度控制
-                    min_extra = 2 if code_lens.max().item() <= 16 else 4
-                    target_lengths = (code_lens * scale).long().clamp(min=code_lens + min_extra)
+        # 为每个句子启动一个任务，实现句级并发
+        # 针对每个句子启动独立任务，充分利用 GPT + s2mel + BigVGAN 并行能力
+        tasks = [_process_single_sentence_pipeline(sent) for sent in sentences]
+        results = await asyncio.gather(*tasks)
 
-                    cond = self.s2mel.models['length_regulator'](S_infer,
-                                                                 ylens=target_lengths,
-                                                                 n_quantizers=3,
-                                                                 f0=None)[0]
-                    cat_condition = torch.cat([prompt_condition, cond], dim=1)
-                    vc_target = self.s2mel.models['cfm'].inference(cat_condition,
-                                                                   torch.LongTensor([cat_condition.size(1)]).to(
-                                                                       cond.device),
-                                                                   ref_mel, style, None, diffusion_steps,
-                                                                   inference_cfg_rate=inference_cfg_rate)
-                    vc_target = vc_target[:, :, ref_mel.size(-1):]
+        wavs = []
+        gpt_gen_time = 0.0
+        gpt_forward_time = 0.0
+        s2mel_time = 0.0
+        bigvgan_time = 0.0
 
-                    # 在 Mel-Spectrogram 层面调整语速（支持 0.5-2.0 倍速）
-                    if speed_factor != 1.0:
-                        # vc_target shape: [batch, n_mels, time]
-                        new_time = max(1, int(vc_target.shape[-1] / speed_factor))
-                        if new_time != vc_target.shape[-1]:
-                            vc_target = F.interpolate(vc_target, size=new_time, mode="linear", align_corners=False)
-                            if verbose:
-                                print(
-                                    f">> Speed adjusted by factor {speed_factor:.2f}, mel time: {vc_target.shape[-1]}")
-                    s2mel_time += time.perf_counter() - m_start_time
+        for wav_cpu, local_gpt_gen, local_gpt_forward, local_s2mel, local_bigvgan in results:
+            wavs.append(wav_cpu)
+            gpt_gen_time += local_gpt_gen
+            gpt_forward_time += local_gpt_forward
+            s2mel_time += local_s2mel
+            bigvgan_time += local_bigvgan
 
-                    m_start_time = time.perf_counter()
-                    wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)
-                    bigvgan_time += time.perf_counter() - m_start_time
-                    wav = wav.squeeze(1)
-
-                wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
-                if verbose:
-                    print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
-                # wavs.append(wav[:, :-512])
-                # logger.error(f"time per token: {wav.shape[-1] / sampling_rate / codes.shape[-1]}, {wav.shape[-1] / sampling_rate / vc_target.shape[-1]}")
-                wavs.append(wav.cpu())  # to cpu before saving
         end_time = time.perf_counter()
 
         wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
@@ -513,16 +599,16 @@ class IndexTTS2:
             # 重新裁剪到有效范围，防止溢出
             wav = torch.clamp(wav, -32767.0, 32767.0)
             if verbose:
-                logger.info(f">> Volume adjusted by gain factor: {volume_gain:.2f}")
+                print(f">> Volume adjusted by gain factor: {volume_gain:.2f}")
         
         wav_length = wav.shape[-1] / sampling_rate
-        logger.info(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
-        logger.info(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
-        logger.info(f">> s2mel_time: {s2mel_time:.2f} seconds")
-        logger.info(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
-        logger.info(f">> Total inference time: {end_time - start_time:.2f} seconds")
-        logger.info(f">> Generated audio length: {wav_length:.2f} seconds")
-        logger.info(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
+        print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
+        print(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
+        print(f">> s2mel_time: {s2mel_time:.2f} seconds")
+        print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
+        print(f">> Total inference time: {end_time - start_time:.2f} seconds")
+        print(f">> Generated audio length: {wav_length:.2f} seconds")
+        print(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
 
         # save audio
         wav = wav.cpu()  # to cpu
@@ -530,11 +616,11 @@ class IndexTTS2:
             # 直接保存音频到指定路径中
             if os.path.isfile(output_path):
                 os.remove(output_path)
-                logger.info(f">> remove old wav file: {output_path}")
+                print(">> remove old wav file:", output_path)
             if os.path.dirname(output_path) != "":
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
             torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)
-            logger.info(f">> wav file saved to: {output_path}")
+            print(">> wav file saved to:", output_path)
             return output_path
         else:
             # 返回以符合Gradio的格式要求
@@ -550,7 +636,6 @@ def find_most_similar_cosine(query_vector, matrix):
     similarities = F.cosine_similarity(query_vector, matrix, dim=1)
     most_similar_index = torch.argmax(similarities)
     return most_similar_index
-
 
 class QwenEmotion:
     def __init__(self, model_dir, gpu_memory_utilization=0.1):
@@ -596,7 +681,7 @@ class QwenEmotion:
         content = content.replace("}", "")
         content = content.replace('"', "")
         parts = content.strip().split(',')
-        # print(parts)
+        print(parts)
         parts_dict = {}
         desired_order = ["高兴", "愤怒", "悲伤", "恐惧", "反感", "低落", "惊讶", "自然"]
         for part in parts:
@@ -652,12 +737,12 @@ class QwenEmotion:
         # )
         # output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
 
+
         sampling_params = SamplingParams(
             max_tokens=2048,  # 32768
         )
         tokens_prompt = TokensPrompt(prompt_token_ids=model_inputs)
-        output_generator = self.model.generate(tokens_prompt, sampling_params=sampling_params,
-                                               request_id=uuid.uuid4().hex)
+        output_generator = self.model.generate(tokens_prompt, sampling_params=sampling_params, request_id=uuid.uuid4().hex)
         async for output in output_generator:
             pass
         output_ids = output.outputs[0].token_ids[:-2]

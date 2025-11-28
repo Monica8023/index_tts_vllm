@@ -2,6 +2,7 @@ import os
 import asyncio
 import io
 import traceback
+import warnings
 from http import HTTPStatus
 from concurrent.futures import ThreadPoolExecutor
 
@@ -27,7 +28,7 @@ try:
 except Exception:
     oss2 = None
 
-from indextts.infer_vllm_v2 import IndexTTS2
+from indextts.infer_vllm_v2_optimiza import IndexTTS2
 
 
 
@@ -325,7 +326,8 @@ async def tts_api_url(request: Request):
                 max_text_tokens_per_sentence = int(data.get("max_text_tokens_per_sentence", 150))
                 oss_prefix_key = data.get("ossPrefix", None)
                 redis_prefix = data.get("redisPrefix", None)
-                speed_factor = data.get("speedFactor", 1.0)
+                speed_factor = data.get("speedFactor", 1.0)  # 控制语速：>1 更快，<1 更慢
+                volume_gain = float(data.get("volumeGain", 1.0))  # 控制音量：0.0-2.0，1.0为原始音量
 
                 if type(emo_control_method) is not int:
                     emo_control_method = emo_control_method.value
@@ -368,7 +370,7 @@ async def tts_api_url(request: Request):
                     raise ValueError(f"音频文件无效或损坏: {infer_input_path}")
 
                 inference_start_time = time.perf_counter()
-                print(f"speedFactor:{speed_factor}")
+                logger.debug(f"[批量TTS] 批次ID: {batch_id}, 索引: {idx}, speedFactor: {speed_factor}, volumeGain: {volume_gain}")
                 sr, wav = await tts.infer(
                     spk_audio_prompt=infer_input_path,
                     text=text,
@@ -380,7 +382,8 @@ async def tts_api_url(request: Request):
                     emo_text=emo_text,
                     use_random=emo_random,
                     max_text_tokens_per_sentence=max_text_tokens_per_sentence,
-                    speed_factor = speed_factor,
+                    speed_factor=speed_factor,  # 将语速配置传给推理管线
+                    volume_gain=volume_gain,  # 音量增益：0.0-2.0，1.0为原始音量
                 )
                 inference_time = time.perf_counter() - inference_start_time
                 logger.info(f"[批量TTS] 批次ID: {batch_id}, 索引: {idx}, 推理完成，耗时: {inference_time:.2f}秒")
