@@ -257,8 +257,8 @@ class IndexTTS2:
         max_len = code_lens_tensor.max().item()
         # 极短文本 (<= 32 tokens): 提升到 1.30 (原优化方案曾降至1.0/1.05)
         # 给予足够的时长进行发音，多余的静音由 post-processing 切除
-        # if max_len <= 16:  # 约1-2个字
-        #     return 1.0
+        if max_len <= 15:  # 约1-2个字
+            return 1.1
         if max_len <= 32:
             return 1.30
         if max_len <= 64:
@@ -289,8 +289,8 @@ class IndexTTS2:
             # 2. 设置缓冲区 (Buffer)
             # 开头保留 0.05秒 (50ms)，防止切掉爆破音（如 P, T, K 等）
             # 结尾保留 0.1秒 (100ms)，让声音自然衰减
-            head_padding = int(sampling_rate * 0.2)
-            tail_padding = int(sampling_rate * 0.3)
+            head_padding = int(sampling_rate * 0.05)
+            tail_padding = int(sampling_rate * 0.1)
 
             # 3. 应用缓冲并防止越界
             start_idx = max(0, start_idx - head_padding)
@@ -492,12 +492,13 @@ class IndexTTS2:
                     current_max_len = code_lens.max().item()
                     # --- 优化 1: 动态调整步数 ---
                     # 极短文本步数稍增或保持，保证生成质量，防止欠拟合导致的杂音
-                    diffusion_steps = 20 if current_max_len <= 32 else 25
+                    diffusion_steps = 30 if current_max_len <= 32 else 25
                     # --- 优化 2: 提高 CFG (关键) ---
                     # 极短文本使用更高的 CFG (0.8 - 1.0) 来抑制幻觉/杂音，强制对齐
-                    # 2. 保持高 CFG: 抑制背景杂音和幻觉
-                    if current_max_len <= 32:
-                        inference_cfg_rate = 0.8  # 保持 0.8，这对短文本很关键
+                    if current_max_len <= 15:
+                        inference_cfg_rate = 0.9
+                    elif current_max_len <= 32:
+                        inference_cfg_rate = 0.8
                     else:
                         inference_cfg_rate = 0.7
                     latent = self.s2mel.models['gpt_layer'](latent)
@@ -507,8 +508,10 @@ class IndexTTS2:
                     scale = self._calc_dynamic_target_scale(code_lens)
                     # 对极短文本使用更精确的最小长度控制
                     # --- 优化 3: 严格的长度控制 ---
-                    if current_max_len <= 32:
-                        min_extra = 9
+                    if current_max_len <= 15:
+                        min_extra = 4
+                    elif current_max_len <= 32:
+                        min_extra = 6  # 稍微降一点，配合 Scale 1.3 足够了
                     else:
                         min_extra = 5
                     target_lengths = (code_lens * scale).long().clamp(min=code_lens + min_extra)
