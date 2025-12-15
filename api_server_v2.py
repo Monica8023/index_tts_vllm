@@ -2,7 +2,6 @@ import os
 import asyncio
 import io
 import traceback
-import warnings
 from http import HTTPStatus
 from concurrent.futures import ThreadPoolExecutor
 
@@ -28,7 +27,7 @@ try:
 except Exception:
     oss2 = None
 
-from indextts.infer_vllm_v2_optimiza import IndexTTS2
+from indextts.infer_vllm_v2 import IndexTTS2
 
 
 
@@ -382,7 +381,7 @@ async def tts_api_url(request: Request):
                     emo_text=emo_text,
                     use_random=emo_random,
                     max_text_tokens_per_sentence=max_text_tokens_per_sentence,
-                    speed_factor=speed_factor,  # 将语速配置传给推理管线
+                    speed_factor = speed_factor,
                     volume_gain=volume_gain,  # 音量增益：0.0-2.0，1.0为原始音量
                 )
                 inference_time = time.perf_counter() - inference_start_time

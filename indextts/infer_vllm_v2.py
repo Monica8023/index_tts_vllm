@@ -36,6 +36,7 @@ from indextts.s2mel.modules.campplus.DTDNN import CAMPPlus
 from indextts.s2mel.modules.audio import mel_spectrogram
 
 import torch.nn.functional as F
+import asyncio
 
 from vllm import SamplingParams, TokensPrompt
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -78,6 +79,9 @@ class IndexTTS2:
         self.model_dir = model_dir
         self.dtype = torch.float16 if self.is_fp16 else None
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
+
+        self.inference_lock = asyncio.Lock()
+        logger.info(">> Internal Inference Lock initialized.")
 
         vllm_dir = os.path.join(model_dir, "gpt")
         engine_args = AsyncEngineArgs(
@@ -258,9 +262,9 @@ class IndexTTS2:
         # 极短文本 (<= 32 tokens): 提升到 1.30 (原优化方案曾降至1.0/1.05)
         # 给予足够的时长进行发音，多余的静音由 post-processing 切除
         if max_len <= 15:  # 约1-2个字
-            return 1.1
+            return 1.05
         if max_len <= 32:
-            return 1.30
+            return 1.1
         if max_len <= 64:
             return 1.40
         if max_len <= 96:
@@ -304,10 +308,11 @@ class IndexTTS2:
         # 如果全是静音或检测失败，返回原音频
         return wav
 
+    @torch.inference_mode()
     async def infer(self, spk_audio_prompt, text, output_path,
                     emo_audio_prompt=None, emo_alpha=1.0,
                     emo_vector=None,
-                    use_emo_text=False, emo_text=None, use_random=False, interval_silence=100,
+                    use_emo_text=False, emo_text=None, use_random=False, interval_silence=50,
                     verbose=False, max_text_tokens_per_sentence=150, speed_factor=1.0, volume_gain=1.0,
                     **generation_kwargs):
         logger.info(">> start inference...")
@@ -495,12 +500,13 @@ class IndexTTS2:
                     diffusion_steps = 30 if current_max_len <= 32 else 25
                     # --- 优化 2: 提高 CFG (关键) ---
                     # 极短文本使用更高的 CFG (0.8 - 1.0) 来抑制幻觉/杂音，强制对齐
+                    # 2. 保持高 CFG: 抑制背景杂音和幻觉
                     if current_max_len <= 15:
                         inference_cfg_rate = 0.9
                     elif current_max_len <= 32:
                         inference_cfg_rate = 0.8
                     else:
-                        inference_cfg_rate = 0.7
+                        inference_cfg_rate = 0.8
                     latent = self.s2mel.models['gpt_layer'](latent)
                     S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
                     S_infer = S_infer.transpose(1, 2)
@@ -509,9 +515,11 @@ class IndexTTS2:
                     # 对极短文本使用更精确的最小长度控制
                     # --- 优化 3: 严格的长度控制 ---
                     if current_max_len <= 15:
-                        min_extra = 4
+                        min_extra = 1
+                        if len(text) <= 2:
+                            min_extra = 0
                     elif current_max_len <= 32:
-                        min_extra = 6  # 稍微降一点，配合 Scale 1.3 足够了
+                        min_extra = 2  # 稍微降一点，配合 Scale 1.3 足够了
                     else:
                         min_extra = 5
                     target_lengths = (code_lens * scale).long().clamp(min=code_lens + min_extra)
@@ -521,28 +529,37 @@ class IndexTTS2:
                                                                  n_quantizers=3,
                                                                  f0=None)[0]
                     cat_condition = torch.cat([prompt_condition, cond], dim=1)
-                    vc_target = self.s2mel.models['cfm'].inference(cat_condition,
-                                                                   torch.LongTensor([cat_condition.size(1)]).to(
-                                                                       cond.device),
-                                                                   ref_mel, style, None, diffusion_steps,
-                                                                   inference_cfg_rate=inference_cfg_rate)
-                    vc_target = vc_target[:, :, ref_mel.size(-1):]
 
-                    # 在 Mel-Spectrogram 层面调整语速（支持 0.5-2.0 倍速）
-                    if speed_factor != 1.0:
-                        # vc_target shape: [batch, n_mels, time]
-                        new_time = max(1, int(vc_target.shape[-1] / speed_factor))
-                        if new_time != vc_target.shape[-1]:
-                            vc_target = F.interpolate(vc_target, size=new_time, mode="linear", align_corners=False)
-                            if verbose:
-                                print(
-                                    f">> Speed adjusted by factor {speed_factor:.2f}, mel time: {vc_target.shape[-1]}")
-                    s2mel_time += time.perf_counter() - m_start_time
+                    # 加锁 只锁住 Diffusion 和 BigVGAN 这两个显存杀手/状态敏感区
+                    async with self.inference_lock:
+                        # 2. Diffusion 生成 (最容易串音/幻觉的地方)
+                        vc_target = self.s2mel.models['cfm'].inference(cat_condition,
+                                                                       torch.LongTensor([cat_condition.size(1)]).to(
+                                                                           cond.device),
+                                                                       ref_mel, style, None, diffusion_steps,
+                                                                       inference_cfg_rate=inference_cfg_rate)
+                        vc_target = vc_target[:, :, ref_mel.size(-1):]
 
-                    m_start_time = time.perf_counter()
-                    wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)
-                    bigvgan_time += time.perf_counter() - m_start_time
-                    wav = wav.squeeze(1)
+                        # 在 Mel-Spectrogram 层面调整语速（支持 0.5-2.0 倍速）
+                        # 3. 语速调整 (纯 Tensor 操作，包含在锁内很安全)
+                        if speed_factor != 1.0:
+                            # vc_target shape: [batch, n_mels, time]
+                            new_time = max(1, int(vc_target.shape[-1] / speed_factor))
+                            if new_time != vc_target.shape[-1]:
+                                vc_target = F.interpolate(vc_target, size=new_time, mode="linear", align_corners=False)
+                                if verbose:
+                                    print(
+                                        f">> Speed adjusted by factor {speed_factor:.2f}, mel time: {vc_target.shape[-1]}")
+                        s2mel_time += time.perf_counter() - m_start_time
+
+                        # 4. BigVGAN 声码器 (显存大户)
+                        m_start_time = time.perf_counter()
+                        wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)
+                        bigvgan_time += time.perf_counter() - m_start_time
+                        wav = wav.squeeze(1)
+
+                        # 5. 确保在此处释放显存碎块 (可选，但推荐)
+                        torch.cuda.empty_cache()
 
                 wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
                 if verbose:
