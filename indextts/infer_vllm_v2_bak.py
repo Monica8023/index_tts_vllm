@@ -17,7 +17,6 @@ from transformers import AutoTokenizer
 from modelscope import AutoModelForCausalLM
 import safetensors
 from loguru import logger
-import numpy as np
 
 import warnings
 
@@ -219,11 +218,13 @@ class IndexTTS2:
         return feat
 
     def insert_interval_silence(self, wavs, sampling_rate=22050, interval_silence=200):
+        """
+        Insert silences between sentences.
+        wavs: List[torch.tensor]
+        """
+
         if not wavs or interval_silence <= 0:
             return wavs
-
-        if interval_silence > 100:
-            interval_silence = 100
 
         # 若整体时长极短（例如 2~3 个字），直接返回，避免人为塞静音
         total_duration_sec = sum(wav.size(-1) for wav in wavs) / sampling_rate
@@ -250,13 +251,6 @@ class IndexTTS2:
         for i, wav in enumerate(wavs):
             wavs_list.append(wav)
             if i < len(wavs) - 1:
-                eff_silence = max(10, adaptive_interval - 50)  # 扣除一部分假设的 tail
-
-                jitter = random.uniform(0.8, 1.2)
-                final_silence_ms = eff_silence * jitter
-
-                sil_dur = int(sampling_rate * final_silence_ms / 1000.0)
-                sil_tensor = torch.zeros(wav.size(0), sil_dur).to(wav.device)
                 wavs_list.append(sil_tensor)
 
         return wavs_list
@@ -267,66 +261,59 @@ class IndexTTS2:
         max_len = code_lens_tensor.max().item()
         # 极短文本 (<= 32 tokens): 提升到 1.30 (原优化方案曾降至1.0/1.05)
         # 给予足够的时长进行发音，多余的静音由 post-processing 切除
-        if max_len <= 32:  # 约1-2个字
+        if max_len <= 15:  # 约1-2个字
+            return 1.05
+        if max_len <= 32:
             return 1.1
-        return 1.4
+        if max_len <= 64:
+            return 1.35
+        if max_len <= 96:
+            return 1.45
+        if max_len <= 140:
+            return 1.55
+        return 1.60
 
     @staticmethod
     def trim_long_silence(wav, sampling_rate=22050, top_db=30):
         """
-        优化版：
-        1. 头部：不切割模型生成的开头（保护弱起音），但在最前面人为拼接一段微小的静音，缓解突兀感。
-        2. 尾部：基于静音检测去除多余空白，保留少量缓冲。
-        """
+                修改版：完全保留音频开头（不切头），只去除音频结尾的静音。
+                解决“喂”等起音柔和字被切音的问题。
+                """
         wav_np = wav.squeeze().cpu().numpy()
 
         # 使用 librosa 检测非静音区间
+        # top_db: 依然用于检测哪里是结尾
         non_silent_intervals = librosa.effects.split(wav_np, top_db=top_db)
 
         if len(non_silent_intervals) > 0:
-            # 1. 强制设定起点为 0 (不切除模型生成的任何开头内容)
+            # 1. 强制设定起点为 0 (不切割开头)
             start_idx = 0
 
-            # 2. 获取有效声音的结束点
+            # 2. 获取有效声音的 结束点
+            # 既然主要问题是开头被切，结尾逻辑保持不变即可，或者也可以稍微放宽
             end_idx = non_silent_intervals[-1][1]
 
-            # 3. 设置尾部缓冲区 (Tail Buffer) - 0.1秒
-            tail_padding = int(sampling_rate * 0.1)
+            # 3. 设置结尾缓冲区 (Buffer)
+            # 结尾保留 0.1秒 (100ms)，让声音自然衰减，不至于突然断掉
+            tail_padding = int(sampling_rate * 0.05)
+
+            # 4. 应用缓冲并防止越界
             end_idx = min(len(wav_np), end_idx + tail_padding)
 
-            # 4. 执行裁剪：只裁尾部，不裁头部
-            wav_np_trimmed = wav_np[start_idx:end_idx]
+            # 5. 执行裁剪：从 0 裁到 结尾
+            wav_np = wav_np[start_idx:end_idx]
 
-            # 【可选】给实际音频做一个微小的淡入 (10ms)，彻底消除拼接处的爆破音
-            fade_in_len = int(sampling_rate * 0.01)  # 10ms
-            if len(wav_np_trimmed) > fade_in_len:
-                fade_curve = np.linspace(0, 1, fade_in_len)
-                wav_np_trimmed[:fade_in_len] = wav_np_trimmed[:fade_in_len] * fade_curve
-
-            # ================= 新增逻辑：头部添加静音 =================
-            # 设置头部静音时长 (建议 0.05s 到 0.1s，即 50ms-100ms)
-            # 这能给听感一个缓冲，避免"吓一跳"的感觉
-            head_padding_sec = 0.05
-            head_silence_len = int(sampling_rate * head_padding_sec)
-
-            # 创建静音数组
-            head_silence = np.zeros(head_silence_len, dtype=wav_np_trimmed.dtype)
-
-            # 拼接：[静音] + [裁剪后的音频]
-            wav_np_final = np.concatenate((head_silence, wav_np_trimmed))
-            # ========================================================
-
-            return torch.from_numpy(wav_np_final).unsqueeze(0).to(wav.device)
+            return torch.from_numpy(wav_np).unsqueeze(0).to(wav.device)
 
         # 如果全是静音或检测失败，返回原音频
         return wav
 
-    @torch.no_grad()
+    @torch.inference_mode()
     async def infer(self, spk_audio_prompt, text, output_path,
                     emo_audio_prompt=None, emo_alpha=1.0,
                     emo_vector=None,
                     use_emo_text=False, emo_text=None, use_random=False, interval_silence=100,
-                    verbose=False, max_text_tokens_per_sentence=150, speed_factor=1.0, volume_gain=1.0,
+                    verbose=False, max_text_tokens_per_sentence=150, speed_factor=0.9, volume_gain=1.0,
                     **generation_kwargs):
         logger.info(">> start inference...")
         start_time = time.perf_counter()
@@ -452,6 +439,15 @@ class IndexTTS2:
                     emo_vec=emovec,
                 )
                 gpt_gen_time += time.perf_counter() - m_start_time
+                # if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
+                #     warnings.warn(
+                #         f"WARN: generation stopped due to exceeding `max_mel_tokens` ({self.cfg.gpt.max_mel_tokens}). "
+                #         f"Current output shape: {codes.shape}. "
+                #         f"Input text tokens: {text_tokens.shape[1]}. "
+                #         f"Consider reducing `max_text_tokens_per_sentence`({max_text_tokens_per_sentence}) or increasing `max_mel_tokens`.",
+                #         category=RuntimeWarning
+                #     )
+                #     has_warned = True
 
                 # codes = torch.tensor(codes, dtype=torch.long, device=self.device).unsqueeze(0)
                 code_lens = torch.tensor([codes.shape[-1]], device=codes.device, dtype=codes.dtype)
@@ -475,6 +471,11 @@ class IndexTTS2:
 
                 m_start_time = time.perf_counter()
                 use_speed = torch.zeros(spk_cond_emb.size(0)).to(spk_cond_emb.device).long()
+                # latent = self.gpt(speech_conditioning_latent, text_tokens,
+                #                 torch.tensor([text_tokens.shape[-1]], device=text_tokens.device), codes,
+                #                 code_lens*self.gpt.mel_length_compression,
+                #                 cond_mel_lengths=torch.tensor([speech_conditioning_latent.shape[-1]], device=text_tokens.device),
+                #                 return_latent=True, clip_inputs=False)
                 latent = self.gpt(
                     speech_conditioning_latent,
                     text_tokens,
@@ -500,29 +501,23 @@ class IndexTTS2:
                     # --- 优化 2: 提高 CFG (关键) ---
                     # 极短文本使用更高的 CFG (0.8 - 1.0) 来抑制幻觉/杂音，强制对齐
                     # 2. 保持高 CFG: 抑制背景杂音和幻觉
-                    inference_cfg_rate = 0.90 if current_max_len <= 32 else 0.8
+                    inference_cfg_rate = 0.75
                     latent = self.s2mel.models['gpt_layer'](latent)
                     S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
                     S_infer = S_infer.transpose(1, 2)
                     S_infer = S_infer + latent
-                    # scale = self._calc_dynamic_target_scale(code_lens)
-                    # 定义一个基础长度缩放
-                    base_scale = self._calc_dynamic_target_scale(code_lens)
-
-                    # 应用用户设定的 final_speed_factor (注意：这里要取倒数，语速越慢，长度越长)
-                    if speed_factor > 0:
-                        final_scale = base_scale / speed_factor
-                    else:
-                        final_scale = base_scale
-
-                    target_lengths = (code_lens * final_scale).long()
+                    scale = self._calc_dynamic_target_scale(code_lens)
                     # 对极短文本使用更精确的最小长度控制
                     # --- 优化 3: 严格的长度控制 ---
-                    if current_max_len <= 32:
+                    if current_max_len <= 15:
+                        min_extra = 1
+                        if len(text) <= 2:
+                            min_extra = 0
+                    elif current_max_len <= 32:
                         min_extra = 2  # 稍微降一点，配合 Scale 1.3 足够了
                     else:
                         min_extra = 5
-                    target_lengths = target_lengths.clamp(min=code_lens + min_extra)
+                    target_lengths = (code_lens * scale).long().clamp(min=code_lens + min_extra)
 
                     cond = self.s2mel.models['length_regulator'](S_infer,
                                                                  ylens=target_lengths,
@@ -540,6 +535,16 @@ class IndexTTS2:
                                                                        inference_cfg_rate=inference_cfg_rate)
                         vc_target = vc_target[:, :, ref_mel.size(-1):]
 
+                        # 在 Mel-Spectrogram 层面调整语速（支持 0.5-2.0 倍速）
+                        # 3. 语速调整 (纯 Tensor 操作，包含在锁内很安全)
+                        if speed_factor != 1.0:
+                            # vc_target shape: [batch, n_mels, time]
+                            new_time = max(1, int(vc_target.shape[-1] / speed_factor))
+                            if new_time != vc_target.shape[-1]:
+                                vc_target = F.interpolate(vc_target, size=new_time, mode="linear", align_corners=False)
+                                if verbose:
+                                    print(
+                                        f">> Speed adjusted by factor {speed_factor:.2f}, mel time: {vc_target.shape[-1]}")
                         s2mel_time += time.perf_counter() - m_start_time
 
                         # 4. BigVGAN 声码器 (显存大户)
@@ -558,7 +563,7 @@ class IndexTTS2:
                 # --- 优化: 对单句进行尾部静音裁剪 ---
                 # 仅针对短句开启裁剪，或者全局开启
                 # if code_lens.max().item() <= 64:
-                wav = self.trim_long_silence(wav, sampling_rate=sampling_rate, top_db=30)
+                wav = self.trim_long_silence(wav, sampling_rate=sampling_rate, top_db=40)
                 # ---------------------------------
 
                 wavs.append(wav.cpu())  # to cpu before saving
@@ -570,37 +575,13 @@ class IndexTTS2:
 
         # 音量控制：应用增益因子调整音量（volume_gain: 0.0-2.0，1.0为原始音量）
         if volume_gain != 1.0:
-            # 1. 防止音量过大导致爆音：先计算当前最大振幅
-            max_amp = torch.max(torch.abs(wav))
-
-            # 2. 如果是放大音量 (gain > 1.0)
-            if volume_gain > 1.0:
-                # 计算允许的最大增益，防止削波
-                # 32767 是 int16 的最大值，留一点余量(0.99)防止边缘爆音
-                threshold = 32767.0 * 0.99
-                if max_amp > 0:
-                    # 允许的最大放大倍数
-                    max_allowable_gain = threshold / max_amp
-                    # 取用户设定值和安全值的较小者
-                    real_gain = min(volume_gain, max_allowable_gain)
-
-                    if real_gain < volume_gain:
-                        logger.warning(
-                            f">> Volume gain capped from {volume_gain} to {real_gain:.2f} to prevent clipping.")
-                else:
-                    real_gain = volume_gain
-
-                wav = wav * real_gain
-
-            # 3. 如果是减小音量 (gain < 1.0)，直接乘即可，是安全的
-            else:
-                wav = wav * volume_gain
-
-            # 最后再做一次安全 clamp，虽然上面逻辑已经尽量避免了
+            # 限制增益范围，避免削波失真
+            volume_gain = max(0.0, min(2.0, volume_gain))
+            wav = wav * volume_gain
+            # 重新裁剪到有效范围，防止溢出
             wav = torch.clamp(wav, -32767.0, 32767.0)
-
             if verbose:
-                logger.info(f">> Volume adjusted. Max amplitude: {torch.max(torch.abs(wav)):.2f}")
+                logger.info(f">> Volume adjusted by gain factor: {volume_gain:.2f}")
 
         wav_length = wav.shape[-1] / sampling_rate
         logger.info(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")

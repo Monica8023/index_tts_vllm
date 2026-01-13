@@ -74,6 +74,7 @@ class TextNormalizer:
     # 匹配常见英语缩写 's，仅用于替换为 is，不匹配所有 's
     ENGLISH_CONTRACTION_PATTERN = r"(what|where|who|which|how|t?here|it|s?he|that|this)'s"
 
+
     def use_chinese(self, s):
         has_chinese = bool(re.search(r"[\u4e00-\u9fff]", s))
         has_alpha = bool(re.search(r"[a-zA-Z]", s))
@@ -116,7 +117,7 @@ class TextNormalizer:
         if self.use_chinese(text):
             text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
             replaced_text, pinyin_list = self.save_pinyin_tones(text.rstrip())
-
+            
             replaced_text, original_name_list = self.save_names(replaced_text)
             try:
                 result = self.zh_normalizer.normalize(replaced_text)
@@ -296,12 +297,10 @@ class TextTokenizer:
         return vocab
 
     @overload
-    def convert_ids_to_tokens(self, ids: int) -> str:
-        ...
+    def convert_ids_to_tokens(self, ids: int) -> str: ...
 
     @overload
-    def convert_ids_to_tokens(self, ids: List[int]) -> List[str]:
-        ...
+    def convert_ids_to_tokens(self, ids: List[int]) -> List[str]: ...
 
     def convert_ids_to_tokens(self, ids: Union[List[int], int]):
         return self.sp_model.IdToPiece(ids)
@@ -347,9 +346,7 @@ class TextTokenizer:
             tokenized_str: List[str], split_tokens: List[str], max_tokens_per_sentence: int
     ) -> List[List[str]]:
         """
-        修改版：智能动态切分逻辑
-        1. 遇到句号/感叹号/问号 -> 【必须切分】
-        2. 遇到逗号/分号 -> 【按需切分】：只有当前句子过长时，才借用逗号作为切分点，否则保持连贯。
+        将tokenize后的结果按特定token分割 (优化版)
         """
         if len(tokenized_str) == 0:
             return []
@@ -358,84 +355,124 @@ class TextTokenizer:
         current_sentence = []
         current_sentence_tokens_len = 0
 
-        # 【定义两类标点】
-        # 1. 强终止符：遇到必须切 (句号、感叹号、问号、省略号)
-        HARD_STOPS = {".", "!", "?", "...", "。", "！", "？", "……", "…", "▁.", "▁?", "▁..."}
+        # 只有当当前积攒的句子长度超过这个值时，遇到标点才切分。
+        # 设置为 6 意味着像 "喂,你好" (约3-4 token) 这样短的短语会连在一起，不会被打断。
+        MIN_SPLIT_THRESHOLD = 6
 
-        # 2. 软终止符：只有句子太长时才切 (逗号、顿号、分号)
-        SOFT_STOPS = {",", "，", "、", ";", "；", ":", "："}
-
-        # 【长度阈值策略】
-        # 当句子长度超过这个值时，开始寻找最近的“软终止符”进行切分
-        # 建议设置为 max_tokens 的 60%~80%。
-        # 例如 max=150, threshold=90。意味着 90 个 token 以内的逗号都会被忽略，保持连贯。
-        SOFT_SPLIT_THRESHOLD = int(max_tokens_per_sentence * 0.6)
-
+        # 2. 【优化】将 for 循环改为 while 循环，确保索引控制正确
         i = 0
         while i < len(tokenized_str):
             token = tokenized_str[i]
             current_sentence.append(token)
             current_sentence_tokens_len += 1
 
+            # --- 优化点 2: 增加长度判断逻辑 ---
+            # 只有当 (遇到切分符) AND (当前句子足够长) 时，才执行切分
+            is_split_token = token in split_tokens
+            is_long_enough = current_sentence_tokens_len >= MIN_SPLIT_THRESHOLD
+
+            # 特殊情况：如果是强制终止符（如句号、问号），即使短也要切（可选，或者统一逻辑）
+            # 这里建议：逗号需要长才切，句号/问号/感叹号可以直接切
+            is_hard_stop = token in [".", "!", "?", "。", "！", "？", "……"]
+
             should_split = False
 
-            # --- 核心判断逻辑 ---
-
-            # 情况 A: 遇到强终止符 (。, !, ?) -> 必须切
-            if token in HARD_STOPS:
-                should_split = True
-
-            # 情况 B: 遇到软终止符 (，, 、) -> 视长度而定
-            elif token in SOFT_STOPS:
-                if current_sentence_tokens_len >= SOFT_SPLIT_THRESHOLD:
-                    # 只有当前句子已经比较长了，才利用这个逗号进行“透气”切分
-                    should_split = True
+            if is_split_token:
+                if is_hard_stop:
+                    # 强终止符：只要长度 > 1 就切（避免切出单独标点）
+                    should_split = current_sentence_tokens_len > 1
                 else:
-                    # 句子还很短，保留逗号在句子内部，让模型生成连贯语气
-                    should_split = False
+                    # 弱终止符（逗号）：必须句子够长才切，防止 "喂，你好" 被切碎
+                    should_split = is_long_enough
 
-            # 情况 C: 长度强制溢出 -> 必须切 (防止 OOM)
-            # 如果前面一直没遇到标点，被迫在任意位置切断
-            if not should_split and current_sentence_tokens_len >= max_tokens_per_sentence:
-                should_split = True
-                # (可选) 打印警告，提示文本可能缺乏标点
-                # warnings.warn(f"Forced split at token {token}, len={current_sentence_tokens_len}")
-
-            # --- 执行切分动作 ---
             if should_split:
-                # 【回吸逻辑】：检查下一个 token 是否是引号/后括号
-                # 避免把 ["我说。", "”"] 切成两半
+                # ... (处理 's 等后缀的逻辑保持不变) ...
                 if i < len(tokenized_str) - 1:
                     next_token = tokenized_str[i + 1]
-                    # 如果下一个是右引号、右括号等，把它吸纳进当前句子
-                    if next_token in ["'", "▁'", "”", '"', "’", "）", ")", "]", "】"]:
+                    if next_token in ["'", "▁'"]:
                         current_sentence.append(next_token)
                         current_sentence_tokens_len += 1
-                        i += 1  # 跳过下一个 token
+                        i += 1
 
                 sentences.append(current_sentence)
                 current_sentence = []
                 current_sentence_tokens_len = 0
 
+            # 检查当前是否为“切分符号” (包含我们在外部传入的逗号、句号等)
+            # 增加 current_sentence_tokens_len > 1 判断，防止把单独一个逗号切成一句
+            if token in split_tokens and current_sentence_tokens_len > 1:
+
+                # 处理特殊后缀 (如 's, 't 等)
+                if i < len(tokenized_str) - 1:
+                    next_token = tokenized_str[i + 1]
+                    # 如果后面紧跟 ' 或 ▁'，将其归入当前句，不立即断开
+                    if next_token in ["'", "▁'"]:
+                        current_sentence.append(next_token)
+                        current_sentence_tokens_len += 1
+                        i += 1  # 手动跳过下一个token
+
+                # 执行切分
+                sentences.append(current_sentence)
+                current_sentence = []
+                current_sentence_tokens_len = 0
+
+            # 如果没遇到标点，但长度超限了 (强制截断逻辑)
+            elif current_sentence_tokens_len >= max_tokens_per_sentence:
+                # 尝试降级切分：如果还没切分且当前句子里有连字符等其他符号
+                # 注意：因为我们已经把逗号放入了 split_tokens (主逻辑)，所以这里不需要再判断逗号了
+                if "-" in current_sentence and "-" not in split_tokens:
+                    sub_sentences = TextTokenizer.split_sentences_by_token(
+                        current_sentence, ["-"], max_tokens_per_sentence=max_tokens_per_sentence
+                    )
+                    sentences.extend(sub_sentences)
+                else:
+                    # 实在没地方切，直接硬切
+                    sentences.append(current_sentence)
+                    warnings.warn(
+                        f"Sentence forced split at length {len(current_sentence)}. Consider increasing limit.",
+                        RuntimeWarning
+                    )
+
+                current_sentence = []
+                current_sentence_tokens_len = 0
+
             i += 1
 
-        # 处理末尾剩余部分
+        # 处理剩余的 token
         if current_sentence_tokens_len > 0:
             sentences.append(current_sentence)
 
-        return sentences
+        # 3. 【注意】合并逻辑
+        # 如果您希望逗号切分后的停顿非常明显（通过 insert_interval_silence 插入静音），
+        # 那么这些短句不能被合并回去。
+        # 如果您发现切分后语速依然很快，可以注释掉下面这段合并代码，或者减小合并阈值。
+        merged_sentences = []
+        for sentence in sentences:
+            if len(sentence) == 0:
+                continue
+            if len(merged_sentences) == 0:
+                merged_sentences.append(sentence)
+            # 只有当两个句子加起来还很短时才合并。
+            # 建议：如果想让逗号停顿明显，可以调小这个阈值，或者直接不合并。
+            elif len(merged_sentences[-1]) + len(sentence) <= max_tokens_per_sentence:
+                merged_sentences[-1] = merged_sentences[-1] + sentence
+            else:
+                merged_sentences.append(sentence)
+
+        return merged_sentences
 
     def split_sentences(self, tokenized: List[str], max_tokens_per_sentence=120) -> List[List[str]]:
-        # 这里第二个参数其实在新的 split_sentences_by_token 逻辑里不再完全依赖传入的 list
-        # 但为了保持兼容性，我们还是传进去
+        # 将更新后的标点列表传进去
         return self.split_sentences_by_token(
             tokenized, self.punctuation_marks_tokens, max_tokens_per_sentence=max_tokens_per_sentence
         )
+
     # 1. 【优化】扩展标点符号列表，包含中文和逗号
     # 将逗号放入此列表，意味着只要遇到逗号，就会像遇到句号一样进行切分
     punctuation_marks_tokens = [
         ".", "!", "?", "...",  # 英文句末
         "。", "！", "？", "……",  # 中文句末
+        ",", "，", "、", ";", "；",  # 中逗、英逗、顿号、分号 (实现遇逗号停顿)
         "▁.", "▁?", "▁..."  # 特殊Token
     ]
 
@@ -528,7 +565,7 @@ if __name__ == "__main__":
         # 测试 normalize后的字符能被分词器识别
         print(f"`{ch}`", "->", tokenizer.sp_model.Encode(ch, out_type=str))
         print(f"` {ch}`", "->", tokenizer.sp_model.Encode(f" {ch}", out_type=str))
-    max_tokens_per_sentence = 120
+    max_tokens_per_sentence=120
     for i in range(len(cases)):
         print(f"原始文本: {cases[i]}")
         print(f"Normalized: {text_normalizer.normalize(cases[i])}")
@@ -541,7 +578,7 @@ if __name__ == "__main__":
                 print(f"  {j}, count:", len(sentences[j]), ", tokens:", "".join(sentences[j]))
                 if len(sentences[j]) > max_tokens_per_sentence:
                     print(f"Warning: sentence {j} is too long, length: {len(sentences[j])}")
-        # print(f"Token IDs (first 10): {codes[i][:10]}")
+        #print(f"Token IDs (first 10): {codes[i][:10]}")
         if tokenizer.unk_token in codes[i]:
             print(f"Warning: `{cases[i]}` contains UNKNOWN token")
         print(f"Decoded: {tokenizer.decode(codes[i], do_lower_case=True)}")
