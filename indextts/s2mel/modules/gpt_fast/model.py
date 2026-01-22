@@ -145,7 +145,7 @@ class Transformer(nn.Module):
             for b in self.layers:
                 b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim, dtype).to(device)
 
-        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.head_dim,
+        self.freqs_cis = precompute_freqs_cis(self.max_seq_length, self.config.head_dim,
                                               self.config.rope_base, dtype).to(device)
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool)).to(device)
         self.use_kv_cache = use_kv_cache

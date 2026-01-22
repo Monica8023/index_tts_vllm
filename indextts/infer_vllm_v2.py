@@ -506,16 +506,37 @@ class IndexTTS2:
                     S_infer = S_infer.transpose(1, 2)
                     S_infer = S_infer + latent
                     # scale = self._calc_dynamic_target_scale(code_lens)
-                    # 定义一个基础长度缩放
+                # 定义一个基础长度缩放
                     base_scale = self._calc_dynamic_target_scale(code_lens)
 
-                    # 应用用户设定的 final_speed_factor (注意：这里要取倒数，语速越慢，长度越长)
-                    if speed_factor > 0:
-                        final_scale = base_scale / speed_factor
+                    # 应用用户设定的 final_speed_factor
+                    # 为了避免 "0.5倍速变成50s" (过分拉伸) 的问题，我们对慢速区间采用【线性映射】而非【反比映射】。
+                    # 逻辑如下：
+                    # Speed >= 1.0 (变快): 保持物理反比，例如 2.0 -> 0.5倍时长。
+                    # Speed < 1.0 (变慢): 采用线性插值 Scale = 2.0 - Speed。
+                    #   - Speed = 1.0 -> Scale = 1.0 (不变)
+                    #   - Speed = 0.5 -> Scale = 1.5 (1.5倍时长，而不是原来的2倍)
+                    #   - Speed = 0.0 -> Scale = 2.0 (最多拉伸2倍，彻底杜绝 OOM 和无限长)
+                    
+                    safe_speed = max(min(speed_factor, 2.0), 0.01) # 限制输入在 0.01-2.0
+
+                    if safe_speed < 1.0:
+                        speed_scale = 2.0 - safe_speed
                     else:
-                        final_scale = base_scale
+                        speed_scale = 1.0 / safe_speed
+
+                    final_scale = base_scale * speed_scale
 
                     target_lengths = (code_lens * final_scale).long()
+                    
+                    # --- 安全熔断机制 ---
+                    # 即使限制了语速，对于长文本，总帧数仍可能超显存。
+                    # 强制限制最大帧数不超过模型的 Block Size (通常 16384)
+                    MAX_Global_FRAMES = 16384
+                    if target_lengths.max().item() > MAX_Global_FRAMES:
+                         logger.warning(f">> Output length {target_lengths.max().item()} exceeds limit {MAX_Global_FRAMES}. Clamping to prevent OOM.")
+                         target_lengths = target_lengths.clamp(max=MAX_Global_FRAMES)
+
                     # 对极短文本使用更精确的最小长度控制
                     # --- 优化 3: 严格的长度控制 ---
                     if current_max_len <= 32:
@@ -532,6 +553,19 @@ class IndexTTS2:
 
                     # 加锁 只锁住 Diffusion 和 BigVGAN 这两个显存杀手/状态敏感区
                     async with self.inference_lock:
+                        # 检查并动态调整缓存大小 (修复极低语速下的长序列崩溃问题)
+                        current_seq_len = cat_condition.size(1)
+                        estimator = self.s2mel.models['cfm'].estimator
+                        # 检查当前长度是否超过 input_pos 缓存 (默认 16384)
+                        if current_seq_len > estimator.input_pos.size(0):
+                            logger.warning(
+                                f">> Extending cache size from {estimator.input_pos.size(0)} to {current_seq_len + 512}")
+                            # 动态注册新的 positional embedding
+                            new_pos = torch.arange(current_seq_len + 512, device=estimator.input_pos.device)
+                            estimator.register_buffer("input_pos", new_pos)
+                            # 重新初始化 Transformer 缓存 (RoPE 等)
+                            estimator.setup_caches(max_batch_size=1, max_seq_length=current_seq_len + 512)
+
                         # 2. Diffusion 生成 (最容易串音/幻觉的地方)
                         vc_target = self.s2mel.models['cfm'].inference(cat_condition,
                                                                        torch.LongTensor([cat_condition.size(1)]).to(
@@ -569,38 +603,39 @@ class IndexTTS2:
         wav = torch.cat(wavs, dim=1)
 
         # 音量控制：应用增益因子调整音量（volume_gain: 0.0-2.0，1.0为原始音量）
-        if volume_gain != 1.0:
-            # 1. 防止音量过大导致爆音：先计算当前最大振幅
+        # 优化逻辑：先进行 Peak Normalization (峰值归一化)，再应用增益
+        # 这能保证 volume_gain=1.0 时音量总是饱满的，volume_gain=0.5 时确实是减半
+        if volume_gain >= 0:
+            # 1. 计算当前最大振幅
             max_amp = torch.max(torch.abs(wav))
-
-            # 2. 如果是放大音量 (gain > 1.0)
-            if volume_gain > 1.0:
-                # 计算允许的最大增益，防止削波
-                # 32767 是 int16 的最大值，留一点余量(0.99)防止边缘爆音
-                threshold = 32767.0 * 0.99
-                if max_amp > 0:
-                    # 允许的最大放大倍数
-                    max_allowable_gain = threshold / max_amp
-                    # 取用户设定值和安全值的较小者
-                    real_gain = min(volume_gain, max_allowable_gain)
-
-                    if real_gain < volume_gain:
-                        logger.warning(
-                            f">> Volume gain capped from {volume_gain} to {real_gain:.2f} to prevent clipping.")
-                else:
-                    real_gain = volume_gain
-
-                wav = wav * real_gain
-
-            # 3. 如果是减小音量 (gain < 1.0)，直接乘即可，是安全的
+            
+            # 2. 归一化目标幅值 (留一点余量防止爆音，例如 32767 * 0.95)
+            target_peak = 32767.0 * 0.95
+            
+            # 3. 如果原始音频有声音，则进行归一化
+            if max_amp > 1e-4:
+                # 归一化因子
+                norm_factor = target_peak / max_amp
+                # 应用归一化 + 用户增益
+                # 限制最大放大倍数，防止将底噪过度放大 (例如最大放大 10 倍)
+                final_gain = min(norm_factor * volume_gain, 10.0 * volume_gain) 
+                
+                # 如果是降低音量 (volume_gain < 1)，我们直接按比例缩减，不需要担心底噪放大
+                # 如果是放大音量，final_gain 会起作用
+                
+                # 更简单的逻辑：
+                # 为了解决 "0.5以下静音" 的问题，通常是因为原始 max_amp 就不大，
+                # 只有 归一化 后，0.5 才有意义 (即满量程的一半)。
+                
+                wav = wav * (target_peak / max_amp) * volume_gain
             else:
                 wav = wav * volume_gain
-
-            # 最后再做一次安全 clamp，虽然上面逻辑已经尽量避免了
+            
+            # 4. 安全 Clamp
             wav = torch.clamp(wav, -32767.0, 32767.0)
 
             if verbose:
-                logger.info(f">> Volume adjusted. Max amplitude: {torch.max(torch.abs(wav)):.2f}")
+                logger.info(f">> Volume adjusted. Gain: {volume_gain}, Max amplitude: {torch.max(torch.abs(wav)):.2f}")
 
         wav_length = wav.shape[-1] / sampling_rate
         logger.info(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")

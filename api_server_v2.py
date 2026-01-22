@@ -304,7 +304,7 @@ async def tts_api_url(request: Request):
 
         logger.info(f"[批量TTS] 批次ID: {batch_id}, 收到 {len(payload)} 条任务")
 
-        global tts
+        global tts, oss_prefix_key, redis_prefix, text
         results = []
         # 缓存同批次内的远程音频 -> 本地临时文件路径
         remote_audio_cache = {}
@@ -326,7 +326,7 @@ async def tts_api_url(request: Request):
                 oss_prefix_key = data.get("ossPrefix", None)
                 redis_prefix = data.get("redisPrefix", None)
                 speed_factor = data.get("speedFactor", 1.0)  # 控制语速：>1 更快，<1 更慢
-                volume_gain = float(data.get("volumeGain", 1.0))  # 控制音量：0.0-2.0，1.0为原始音量
+                volume_gain = float(data.get("volume", 1.0))  # 控制音量：0.0-2.0，1.0为原始音量
 
                 if type(emo_control_method) is not int:
                     emo_control_method = emo_control_method.value
@@ -404,6 +404,7 @@ async def tts_api_url(request: Request):
                     "status": "success",
                     "ossUrl": oss_object_key,
                     "redisIndex": fixed_redis_index,
+                    "text": text,
                 })
 
             except Exception as item_ex:
@@ -413,6 +414,9 @@ async def tts_api_url(request: Request):
                 results.append({
                     "index": idx,
                     "status": "error",
+                    "ossUrl": oss_prefix_key,
+                    "redisIndex": redis_prefix,
+                    "text": text,
                     "error": str(item_ex),
                 })
 
