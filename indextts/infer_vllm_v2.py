@@ -272,7 +272,7 @@ class IndexTTS2:
         return 1.4
 
     @staticmethod
-    def trim_long_silence(wav, sampling_rate=22050, top_db=50):
+    def trim_long_silence(wav, sampling_rate=22050, top_db=30):
         """
         优化版：
         1. 头部：不切割模型生成的开头（保护弱起音），但在最前面人为拼接一段微小的静音，缓解突兀感。
@@ -300,8 +300,8 @@ class IndexTTS2:
             # 如果裁剪后的有效长度小于 0.5秒 (约11000点)，且原音频本身比较长
             # 说明可能切错了（把主体切掉了），此时保留原样
             if (end_idx - start_idx) < sampling_rate * 0.5:
-                 logger.debug(f">> Trim result too short ({(end_idx - start_idx)/sampling_rate:.2f}s), reverting.")
-                 return wav
+                logger.debug(f">> Trim result too short ({(end_idx - start_idx) / sampling_rate:.2f}s), reverting.")
+                return wav
 
             # 4. 执行裁剪：只裁尾部，不裁头部
             wav_np_trimmed = wav_np[start_idx:end_idx]
@@ -515,7 +515,7 @@ class IndexTTS2:
                     S_infer = S_infer.transpose(1, 2)
                     S_infer = S_infer + latent
                     # scale = self._calc_dynamic_target_scale(code_lens)
-                # 定义一个基础长度缩放
+                    # 定义一个基础长度缩放
                     base_scale = self._calc_dynamic_target_scale(code_lens)
 
                     # 应用用户设定的 final_speed_factor
@@ -526,8 +526,8 @@ class IndexTTS2:
                     #   - Speed = 1.0 -> Scale = 1.0 (不变)
                     #   - Speed = 0.5 -> Scale = 1.5 (1.5倍时长，而不是原来的2倍)
                     #   - Speed = 0.0 -> Scale = 2.0 (最多拉伸2倍，彻底杜绝 OOM 和无限长)
-                    
-                    safe_speed = max(min(speed_factor, 2.0), 0.01) # 限制输入在 0.01-2.0
+
+                    safe_speed = max(min(speed_factor, 2.0), 0.01)  # 限制输入在 0.01-2.0
 
                     if safe_speed < 1.0:
                         speed_scale = 2.0 - safe_speed
@@ -538,14 +538,15 @@ class IndexTTS2:
 
                     target_lengths = (code_lens * final_scale).long()
                     logger.info(f"本条语速控制因子 : {safe_speed}")
-                    
+
                     # --- 安全熔断机制 ---
                     # 即使限制了语速，对于长文本，总帧数仍可能超显存。
                     # 强制限制最大帧数不超过模型的 Block Size (通常 16384)
                     MAX_Global_FRAMES = 16384
                     if target_lengths.max().item() > MAX_Global_FRAMES:
-                         logger.warning(f">> Output length {target_lengths.max().item()} exceeds limit {MAX_Global_FRAMES}. Clamping to prevent OOM.")
-                         target_lengths = target_lengths.clamp(max=MAX_Global_FRAMES)
+                        logger.warning(
+                            f">> Output length {target_lengths.max().item()} exceeds limit {MAX_Global_FRAMES}. Clamping to prevent OOM.")
+                        target_lengths = target_lengths.clamp(max=MAX_Global_FRAMES)
 
                     # 对极短文本使用更精确的最小长度控制
                     # --- 优化 3: 严格的长度控制 ---
