@@ -268,11 +268,11 @@ class IndexTTS2:
         # 极短文本 (<= 32 tokens): 提升到 1.30 (原优化方案曾降至1.0/1.05)
         # 给予足够的时长进行发音，多余的静音由 post-processing 切除
         if max_len <= 32:  # 约1-2个字
-            return 1.1
+            return 1.3  # Fix: 代码应与注释一致，提升到 1.3 以避免语速过快/吞字
         return 1.4
 
     @staticmethod
-    def trim_long_silence(wav, sampling_rate=22050, top_db=30):
+    def trim_long_silence(wav, sampling_rate=22050, top_db=50):
         """
         优化版：
         1. 头部：不切割模型生成的开头（保护弱起音），但在最前面人为拼接一段微小的静音，缓解突兀感。
@@ -281,6 +281,8 @@ class IndexTTS2:
         wav_np = wav.squeeze().cpu().numpy()
 
         # 使用 librosa 检测非静音区间
+        # top_db: 阈值越高，对静音越敏感（不容易误切）；阈值越低（如20），更倾向于把小声音当静音切掉。
+        # 调整为 50db 以保护细微的尾音
         non_silent_intervals = librosa.effects.split(wav_np, top_db=top_db)
 
         if len(non_silent_intervals) > 0:
@@ -293,6 +295,13 @@ class IndexTTS2:
             # 3. 设置尾部缓冲区 (Tail Buffer) - 0.1秒
             tail_padding = int(sampling_rate * 0.1)
             end_idx = min(len(wav_np), end_idx + tail_padding)
+
+            # --- 熔断保护 ---
+            # 如果裁剪后的有效长度小于 0.5秒 (约11000点)，且原音频本身比较长
+            # 说明可能切错了（把主体切掉了），此时保留原样
+            if (end_idx - start_idx) < sampling_rate * 0.5:
+                 logger.debug(f">> Trim result too short ({(end_idx - start_idx)/sampling_rate:.2f}s), reverting.")
+                 return wav
 
             # 4. 执行裁剪：只裁尾部，不裁头部
             wav_np_trimmed = wav_np[start_idx:end_idx]
@@ -528,6 +537,7 @@ class IndexTTS2:
                     final_scale = base_scale * speed_scale
 
                     target_lengths = (code_lens * final_scale).long()
+                    logger.info(f"本条语速控制因子 : {safe_speed}")
                     
                     # --- 安全熔断机制 ---
                     # 即使限制了语速，对于长文本，总帧数仍可能超显存。
@@ -603,39 +613,19 @@ class IndexTTS2:
         wav = torch.cat(wavs, dim=1)
 
         # 音量控制：应用增益因子调整音量（volume_gain: 0.0-2.0，1.0为原始音量）
-        # 优化逻辑：先进行 Peak Normalization (峰值归一化)，再应用增益
-        # 这能保证 volume_gain=1.0 时音量总是饱满的，volume_gain=0.5 时确实是减半
         if volume_gain >= 0:
-            # 1. 计算当前最大振幅
-            max_amp = torch.max(torch.abs(wav))
-            
-            # 2. 归一化目标幅值 (留一点余量防止爆音，例如 32767 * 0.95)
-            target_peak = 32767.0 * 0.95
-            
-            # 3. 如果原始音频有声音，则进行归一化
-            if max_amp > 1e-4:
-                # 归一化因子
-                norm_factor = target_peak / max_amp
-                # 应用归一化 + 用户增益
-                # 限制最大放大倍数，防止将底噪过度放大 (例如最大放大 10 倍)
-                final_gain = min(norm_factor * volume_gain, 10.0 * volume_gain) 
-                
-                # 如果是降低音量 (volume_gain < 1)，我们直接按比例缩减，不需要担心底噪放大
-                # 如果是放大音量，final_gain 会起作用
-                
-                # 更简单的逻辑：
-                # 为了解决 "0.5以下静音" 的问题，通常是因为原始 max_amp 就不大，
-                # 只有 归一化 后，0.5 才有意义 (即满量程的一半)。
-                
-                wav = wav * (target_peak / max_amp) * volume_gain
-            else:
-                wav = wav * volume_gain
-            
-            # 4. 安全 Clamp
-            wav = torch.clamp(wav, -32767.0, 32767.0)
+            # 1. 安全限制：确保增益因子严格在 0.0 到 2.0 之间
+            gain = max(0.1, min(float(volume_gain), 2.0))
+            logger.info(f"本条音量控制因子 : {gain}")
 
-            if verbose:
-                logger.info(f">> Volume adjusted. Gain: {volume_gain}, Max amplitude: {torch.max(torch.abs(wav)):.2f}")
+            # 2. 核心算子：直接对 Tensor 进行线性乘法
+            wav = wav * gain
+
+            # 3. 防削波处理 (Clamping / Clipping)
+            # 当 gain > 1.0 时，部分数值可能超过 1.0 或低于 -1.0，导致保存时产生爆音
+            # 使用 torch.clamp 将其强行限制在有效区间内
+            limit = 32767.0
+            wav = torch.clamp(wav, min=-limit, max=limit)
 
         wav_length = wav.shape[-1] / sampling_rate
         logger.info(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
