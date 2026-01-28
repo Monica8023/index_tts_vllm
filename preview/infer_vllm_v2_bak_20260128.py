@@ -218,116 +218,123 @@ class IndexTTS2:
         feat = (feat - self.semantic_mean) / self.semantic_std
         return feat
 
-    def insert_interval_silence(self, wavs, sampling_rate=22050, interval_silence=100):
-        """
-        由于 trim_long_silence 已经激进地裁剪了头尾静音，
-        这里直接返回原始列表，不再额外插入静音。
-        如果需要控制段间停顿，可以调整 interval_silence 参数。
-        """
-        # 当 interval_silence <= 0 时，不插入任何静音
+    def insert_interval_silence(self, wavs, sampling_rate=22050, interval_silence=200):
         if not wavs or interval_silence <= 0:
             return wavs
-        
-        # 对于极短文本场景，不插入静音
+
+        if interval_silence > 100:
+            interval_silence = 100
+
+        # 若整体时长极短（例如 2~3 个字），直接返回，避免人为塞静音
         total_duration_sec = sum(wav.size(-1) for wav in wavs) / sampling_rate
-        if total_duration_sec < 5.0:
-            logger.debug(f">> Skip silence insertion for short utterance ({total_duration_sec:.2f}s)")
+        if total_duration_sec < 2.4:  # 2.4s
+            logger.debug(f">> Skip silence insertion for ultra-short utterance ({total_duration_sec:.2f}s)")
             return wavs
-        
-        # 只对较长的音频插入少量静音
+
+        # get channel_size
+        channel_size = wavs[0].size(0)
+        # 根据当前文本平均时长动态压缩停顿，避免短文本被静音“拉长”
+        avg_sentence_sec = sum(wav.size(-1) for wav in wavs) / (len(wavs) * sampling_rate)
+        adaptive_interval = interval_silence
+        if avg_sentence_sec < 1.2 and interval_silence > 60:
+            # 将间隔按比例缩短，但至少保留 50ms，防止完全无停顿
+            adaptive_interval = max(50, int(interval_silence * (avg_sentence_sec / 1.2)))
+            logger.debug(
+                f">> Adaptive silence: origin={interval_silence}ms, adjusted={adaptive_interval}ms, avg_sentence_sec={avg_sentence_sec:.2f}"
+            )
+        # get silence tensor
+        sil_dur = int(sampling_rate * adaptive_interval / 1000.0)
+        sil_tensor = torch.zeros(channel_size, sil_dur)
+
         wavs_list = []
         for i, wav in enumerate(wavs):
             wavs_list.append(wav)
-            if i < len(wavs) - 1 and interval_silence > 0:
-                # 插入很少量的静音（因为trim已经裁剪得很紧凑）
-                sil_dur = int(sampling_rate * interval_silence / 1000.0)
+            if i < len(wavs) - 1:
+                eff_silence = max(10, adaptive_interval - 50)  # 扣除一部分假设的 tail
+
+                jitter = random.uniform(0.8, 1.2)
+                final_silence_ms = eff_silence * jitter
+
+                sil_dur = int(sampling_rate * final_silence_ms / 1000.0)
                 sil_tensor = torch.zeros(wav.size(0), sil_dur).to(wav.device)
                 wavs_list.append(sil_tensor)
-        
+
         return wavs_list
 
     @staticmethod
     def _calc_dynamic_target_scale(code_lens_tensor: torch.Tensor) -> float:
-        """
-        针对短句动态调整 target_lengths 的倍率
-        
-        优化思路：
-        - 短文本使用更小的缩放系数，减少模型在音素之间填充的静音帧
-        - 配合后处理的激进裁剪，可以得到更紧凑的音频
-        """
+        """针对短句动态调整 target_lengths 的倍率，避免 1-2 秒文本被拉长"""
         max_len = code_lens_tensor.max().item()
-        
-        # 极短文本 (16 tokens以下)：非常紧凑
-        if max_len <= 16:
-            return 1.15  # 更激进，减少静音填充
-        # 短文本 (32 tokens以下)
-        elif max_len <= 32:
-            return 1.2
-        # 中短文本 (64 tokens以下)
-        elif max_len <= 64:
-            return 1.3
-        # 长文本：标准缩放
+        # 极短文本 (<= 32 tokens): 提升到 1.30 (原优化方案曾降至1.0/1.05)
+        # 给予足够的时长进行发音，多余的静音由 post-processing 切除
+        if max_len <= 32:  # 约1-2个字
+            return 1.1  # Fix: 代码应与注释一致，提升到 1.3 以避免语速过快/吞字
         return 1.4
 
     @staticmethod
-    def trim_long_silence(wav, sampling_rate=22050, top_db=20):
+    def trim_long_silence(wav, sampling_rate=22050, top_db=30):
         """
-        激进版静音裁剪：
-        使用 librosa.effects.trim 直接裁剪头尾静音
-        同时添加淡入淡出避免拼接时的爆破音
+        优化版：
+        1. 头部：不切割模型生成的开头（保护弱起音），但在最前面人为拼接一段微小的静音，缓解突兀感。
+        2. 尾部：基于静音检测去除多余空白，保留少量缓冲。
         """
         wav_np = wav.squeeze().cpu().numpy()
-        original_len = len(wav_np)
-        
-        # 使用 librosa.effects.trim 进行激进的头尾裁剪
-        # top_db: 值越小越激进（更多内容被视为静音）
-        # frame_length=256, hop_length=64 提高检测精度
-        trimmed_wav, trim_indices = librosa.effects.trim(
-            wav_np, 
-            top_db=top_db,  # 使用传入的参数
-            frame_length=256,  # 更小的帧长度，提高精度
-            hop_length=64      # 更小的步长
-        )
-        
-        start_trim = trim_indices[0]
-        end_trim = trim_indices[1]
-        
-        # 熔断保护：如果裁剪后太短，返回原音频
-        if len(trimmed_wav) < sampling_rate * 0.1:  # 至少保留 100ms
-            logger.debug(f">> Trim result too short ({len(trimmed_wav) / sampling_rate:.3f}s), reverting.")
-            return wav
-        
-        # 极少的边界缓冲
-        # 头部：回退 5ms
-        head_buffer = int(sampling_rate * 0.005)
-        start_idx = max(0, start_trim - head_buffer)
-        # 尾部：延长 8ms
-        tail_buffer = int(sampling_rate * 0.008)
-        end_idx = min(original_len, end_trim + tail_buffer)
-        
-        wav_np_trimmed = wav_np[start_idx:end_idx]
-        
-        # 添加淡入（3ms）
-        fade_in_len = int(sampling_rate * 0.003)
-        if len(wav_np_trimmed) > fade_in_len:
-            fade_in_curve = np.linspace(0, 1, fade_in_len)
-            wav_np_trimmed[:fade_in_len] = wav_np_trimmed[:fade_in_len] * fade_in_curve
-        
-        # 添加淡出（3ms）
-        fade_out_len = int(sampling_rate * 0.003)
-        if len(wav_np_trimmed) > fade_out_len:
-            fade_out_curve = np.linspace(1, 0, fade_out_len)
-            wav_np_trimmed[-fade_out_len:] = wav_np_trimmed[-fade_out_len:] * fade_out_curve
-        
-        logger.debug(f">> Trimmed: {original_len/sampling_rate:.3f}s -> {len(wav_np_trimmed)/sampling_rate:.3f}s (cut {(original_len-len(wav_np_trimmed))/sampling_rate:.3f}s)")
-        
-        return torch.from_numpy(wav_np_trimmed).unsqueeze(0).to(wav.device)
+
+        # 使用 librosa 检测非静音区间
+        # top_db: 阈值越高，对静音越敏感（不容易误切）；阈值越低（如20），更倾向于把小声音当静音切掉。
+        # 调整为 50db 以保护细微的尾音
+        non_silent_intervals = librosa.effects.split(wav_np, top_db=top_db)
+
+        if len(non_silent_intervals) > 0:
+            # 1. 强制设定起点为 0 (不切除模型生成的任何开头内容)
+            start_idx = 0
+
+            # 2. 获取有效声音的结束点
+            end_idx = non_silent_intervals[-1][1]
+
+            # 3. 设置尾部缓冲区 (Tail Buffer) - 0.1秒
+            tail_padding = int(sampling_rate * 0.1)
+            end_idx = min(len(wav_np), end_idx + tail_padding)
+
+            # --- 熔断保护 ---
+            # 如果裁剪后的有效长度小于 0.5秒 (约11000点)，且原音频本身比较长
+            # 说明可能切错了（把主体切掉了），此时保留原样
+            if (end_idx - start_idx) < sampling_rate * 0.5:
+                logger.debug(f">> Trim result too short ({(end_idx - start_idx) / sampling_rate:.2f}s), reverting.")
+                return wav
+
+            # 4. 执行裁剪：只裁尾部，不裁头部
+            wav_np_trimmed = wav_np[start_idx:end_idx]
+
+            # 【可选】给实际音频做一个微小的淡入 (10ms)，彻底消除拼接处的爆破音
+            fade_in_len = int(sampling_rate * 0.01)  # 10ms
+            if len(wav_np_trimmed) > fade_in_len:
+                fade_curve = np.linspace(0, 1, fade_in_len)
+                wav_np_trimmed[:fade_in_len] = wav_np_trimmed[:fade_in_len] * fade_curve
+
+            # ================= 新增逻辑：头部添加静音 =================
+            # 设置头部静音时长 (建议 0.05s 到 0.1s，即 50ms-100ms)
+            # 这能给听感一个缓冲，避免"吓一跳"的感觉
+            head_padding_sec = 0.05
+            head_silence_len = int(sampling_rate * head_padding_sec)
+
+            # 创建静音数组
+            head_silence = np.zeros(head_silence_len, dtype=wav_np_trimmed.dtype)
+
+            # 拼接：[静音] + [裁剪后的音频]
+            wav_np_final = np.concatenate((head_silence, wav_np_trimmed))
+            # ========================================================
+
+            return torch.from_numpy(wav_np_final).unsqueeze(0).to(wav.device)
+
+        # 如果全是静音或检测失败，返回原音频
+        return wav
 
     @torch.no_grad()
     async def infer(self, spk_audio_prompt, text, output_path,
                     emo_audio_prompt=None, emo_alpha=1.0,
                     emo_vector=None,
-                    use_emo_text=False, emo_text=None, use_random=False, interval_silence=0,
+                    use_emo_text=False, emo_text=None, use_random=False, interval_silence=100,
                     verbose=False, max_text_tokens_per_sentence=150, speed_factor=1.0, volume_gain=1.0,
                     **generation_kwargs):
         logger.info(">> start inference...")
@@ -596,7 +603,7 @@ class IndexTTS2:
                 # --- 优化: 对单句进行尾部静音裁剪 ---
                 # 仅针对短句开启裁剪，或者全局开启
                 # if code_lens.max().item() <= 64:
-                wav = self.trim_long_silence(wav, sampling_rate=sampling_rate, top_db=20)
+                wav = self.trim_long_silence(wav, sampling_rate=sampling_rate, top_db=30)
                 # ---------------------------------
 
                 wavs.append(wav.cpu())  # to cpu before saving
