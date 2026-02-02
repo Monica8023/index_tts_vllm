@@ -220,57 +220,76 @@ class IndexTTS2:
 
     def insert_interval_silence(self, wavs, sampling_rate=22050, interval_silence=100):
         """
-        由于 trim_long_silence 已经激进地裁剪了头尾静音，
-        这里直接返回原始列表，不再额外插入静音。
-        如果需要控制段间停顿，可以调整 interval_silence 参数。
+        智能插入段间停顿：
+        - 移除了之前"5秒以下不插入"的限制
+        - 根据每句话的时长动态计算停顿（短句用更长停顿，避免"赶"）
+        - interval_silence 作为基础值，实际停顿会根据句长自适应调整
         """
-        # 当 interval_silence <= 0 时，不插入任何静音
-        if not wavs or interval_silence <= 0:
+        if not wavs or len(wavs) <= 1:
             return wavs
-        
-        # 对于极短文本场景，不插入静音
-        total_duration_sec = sum(wav.size(-1) for wav in wavs) / sampling_rate
-        if total_duration_sec < 5.0:
-            logger.debug(f">> Skip silence insertion for short utterance ({total_duration_sec:.2f}s)")
-            return wavs
-        
-        # 只对较长的音频插入少量静音
+
+        # 如果 interval_silence <= 0，使用默认的智能停顿（最小50ms）
+        base_silence_ms = interval_silence if interval_silence > 0 else 50
+
         wavs_list = []
         for i, wav in enumerate(wavs):
             wavs_list.append(wav)
-            if i < len(wavs) - 1 and interval_silence > 0:
-                # 插入很少量的静音（因为trim已经裁剪得很紧凑）
-                sil_dur = int(sampling_rate * interval_silence / 1000.0)
+
+            if i < len(wavs) - 1:
+                # 计算当前句子的时长
+                current_duration_ms = wav.size(-1) / sampling_rate * 1000
+
+                # 动态计算停顿时长：
+                # - 极短句（<500ms）：使用 1.5x 基础停顿，避免听起来太赶
+                # - 短句（500ms-1s）：使用 1.2x 基础停顿
+                # - 正常句（1s-3s）：使用 1.0x 基础停顿
+                # - 长句（>3s）：使用 0.8x 基础停顿，避免间隙过长
+                if current_duration_ms < 500:
+                    silence_factor = 1.5
+                elif current_duration_ms < 1000:
+                    silence_factor = 1.2
+                elif current_duration_ms < 3000:
+                    silence_factor = 1.0
+                else:
+                    silence_factor = 0.8
+
+                actual_silence_ms = base_silence_ms * silence_factor
+                # 确保最小停顿不低于 30ms，最大不超过 500ms
+                actual_silence_ms = max(30, min(actual_silence_ms, 500))
+
+                sil_dur = int(sampling_rate * actual_silence_ms / 1000.0)
                 sil_tensor = torch.zeros(wav.size(0), sil_dur).to(wav.device)
                 wavs_list.append(sil_tensor)
-        
+
+                logger.debug(f">> 句{i + 1}时长={current_duration_ms:.0f}ms, 插入停顿={actual_silence_ms:.0f}ms")
+
+        logger.info(f">> 段间停顿: 共{len(wavs)}句, 基础停顿={base_silence_ms}ms")
         return wavs_list
 
     @staticmethod
     def _calc_dynamic_target_scale(code_lens_tensor: torch.Tensor) -> float:
         """
         针对短句动态调整 target_lengths 的倍率
-        
+
         优化思路：
         - 短文本使用更小的缩放系数，减少模型在音素之间填充的静音帧
         - 配合后处理的激进裁剪，可以得到更紧凑的音频
         """
         max_len = code_lens_tensor.max().item()
-        
-        # 极短文本 (16 tokens以下)：非常紧凑
-        if max_len <= 16:
-            return 1.15  # 更激进，减少静音填充
-        # 短文本 (32 tokens以下)
-        elif max_len <= 32:
-            return 1.2
-        # 中短文本 (64 tokens以下)
-        elif max_len <= 64:
-            return 1.3
-        # 长文本：标准缩放
-        return 1.4
+        if max_len <= 16:  # 约1-2个字
+            return 1.55  # 原1.15，增大缩放让发音更舒缓
+        if max_len <= 32:
+            return 1.55  # 原1.25
+        if max_len <= 64:
+            return 1.5  # 原1.40，两个字通常在此区间
+        if max_len <= 96:
+            return 1.55  # 原1.55
+        if max_len <= 140:
+            return 1.6  # 原1.65
+        return 1.7  # 原1.7
 
     @staticmethod
-    def trim_long_silence(wav, sampling_rate=22050, top_db=20):
+    def trim_long_silence(wav, sampling_rate=22050, top_db=15):
         """
         激进版静音裁剪：
         使用 librosa.effects.trim 直接裁剪头尾静音
@@ -278,57 +297,73 @@ class IndexTTS2:
         """
         wav_np = wav.squeeze().cpu().numpy()
         original_len = len(wav_np)
-        
+
         # 使用 librosa.effects.trim 进行激进的头尾裁剪
         # top_db: 值越小越激进（更多内容被视为静音）
         # frame_length=256, hop_length=64 提高检测精度
         trimmed_wav, trim_indices = librosa.effects.trim(
-            wav_np, 
+            wav_np,
             top_db=top_db,  # 使用传入的参数
             frame_length=256,  # 更小的帧长度，提高精度
-            hop_length=64      # 更小的步长
+            hop_length=64  # 更小的步长
         )
-        
+
         start_trim = trim_indices[0]
         end_trim = trim_indices[1]
-        
+
+        # 计算原始静音时长
+        head_silence_ms = start_trim / sampling_rate * 1000  # 头部静音(ms)
+        tail_silence_ms = (original_len - end_trim) / sampling_rate * 1000  # 尾部静音(ms)
+
         # 熔断保护：如果裁剪后太短，返回原音频
         if len(trimmed_wav) < sampling_rate * 0.1:  # 至少保留 100ms
-            logger.debug(f">> Trim result too short ({len(trimmed_wav) / sampling_rate:.3f}s), reverting.")
+            logger.info(f">> Trim熔断: 裁剪后太短({len(trimmed_wav) / sampling_rate:.3f}s), 保留原音频")
             return wav
-        
-        # 极少的边界缓冲
-        # 头部：回退 5ms
-        head_buffer = int(sampling_rate * 0.005)
+
+        # 边界缓冲：保留自然的起音和收音
+        # 头部：回退 10ms（保留起音的自然过渡）
+        head_buffer_ms = 10
+        head_buffer = int(sampling_rate * head_buffer_ms / 1000)
         start_idx = max(0, start_trim - head_buffer)
-        # 尾部：延长 8ms
-        tail_buffer = int(sampling_rate * 0.008)
+
+        # 尾部：延长 100ms（重要！避免"抢话"感，让句尾有自然的收音和停顿）
+        tail_buffer_ms = 100
+        tail_buffer = int(sampling_rate * tail_buffer_ms / 1000)
         end_idx = min(original_len, end_trim + tail_buffer)
-        
+
+        # 计算实际裁剪效果
+        cut_head_ms = start_idx / sampling_rate * 1000  # 裁掉的头部静音
+        cut_tail_ms = (original_len - end_idx) / sampling_rate * 1000  # 裁掉的尾部静音
+        kept_head_ms = head_silence_ms - cut_head_ms  # 保留的头部缓冲
+        kept_tail_ms = tail_silence_ms - cut_tail_ms  # 保留的尾部缓冲
+
         wav_np_trimmed = wav_np[start_idx:end_idx]
-        
+
         # 添加淡入（3ms）
         fade_in_len = int(sampling_rate * 0.003)
         if len(wav_np_trimmed) > fade_in_len:
             fade_in_curve = np.linspace(0, 1, fade_in_len)
             wav_np_trimmed[:fade_in_len] = wav_np_trimmed[:fade_in_len] * fade_in_curve
-        
+
         # 添加淡出（3ms）
         fade_out_len = int(sampling_rate * 0.003)
         if len(wav_np_trimmed) > fade_out_len:
             fade_out_curve = np.linspace(1, 0, fade_out_len)
             wav_np_trimmed[-fade_out_len:] = wav_np_trimmed[-fade_out_len:] * fade_out_curve
-        
-        logger.debug(f">> Trimmed: {original_len/sampling_rate:.3f}s -> {len(wav_np_trimmed)/sampling_rate:.3f}s (cut {(original_len-len(wav_np_trimmed))/sampling_rate:.3f}s)")
-        
+
+        # 详细日志：统计头尾静音时长
+        logger.info(f">> 静音统计: 原始头部={head_silence_ms:.0f}ms, 原始尾部={tail_silence_ms:.0f}ms | "
+                    f"保留头部={kept_head_ms:.0f}ms, 保留尾部={kept_tail_ms:.0f}ms | "
+                    f"总时长: {original_len / sampling_rate:.3f}s -> {len(wav_np_trimmed) / sampling_rate:.3f}s")
+
         return torch.from_numpy(wav_np_trimmed).unsqueeze(0).to(wav.device)
 
     @torch.no_grad()
     async def infer(self, spk_audio_prompt, text, output_path,
                     emo_audio_prompt=None, emo_alpha=1.0,
                     emo_vector=None,
-                    use_emo_text=False, emo_text=None, use_random=False, interval_silence=0,
-                    verbose=False, max_text_tokens_per_sentence=150, speed_factor=1.0, volume_gain=1.0,
+                    use_emo_text=False, emo_text=None, use_random=False, interval_silence=100,
+                    verbose=True, max_text_tokens_per_sentence=150, speed_factor=1.0, volume_gain=1.0,
                     **generation_kwargs):
         logger.info(">> start inference...")
         start_time = time.perf_counter()
@@ -402,7 +437,6 @@ class IndexTTS2:
         emo_input_features = emo_input_features.to(self.device)
         emo_attention_mask = emo_attention_mask.to(self.device)
         emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
-        speed_factor = speed_factor
 
         text_tokens_list = self.tokenizer.tokenize(text)
         sentences = self.tokenizer.split_sentences(text_tokens_list, max_text_tokens_per_sentence)
@@ -423,6 +457,7 @@ class IndexTTS2:
         for sent in sentences:
             text_tokens = self.tokenizer.convert_tokens_to_ids(sent)
             text_tokens = torch.tensor(text_tokens, dtype=torch.int32, device=self.device).unsqueeze(0)
+            print("当前文本 : {}".format(sent))
 
             if verbose:
                 print(text_tokens)
@@ -496,29 +531,17 @@ class IndexTTS2:
                     m_start_time = time.perf_counter()
                     # 获取当前最大token长度
                     current_max_len = code_lens.max().item()
-                    # --- 优化 1: 动态调整步数 ---
-                    # 极短文本步数稍增或保持，保证生成质量，防止欠拟合导致的杂音
-                    diffusion_steps = 30 if current_max_len <= 32 else 25
-                    # --- 优化 2: 提高 CFG (关键) ---
-                    # 极短文本使用更高的 CFG (0.8 - 1.0) 来抑制幻觉/杂音，强制对齐
-                    # 2. 保持高 CFG: 抑制背景杂音和幻觉
-                    inference_cfg_rate = 0.90 if current_max_len <= 32 else 0.8
+                    diffusion_steps = 32 if current_max_len <= 64 else 25  # 短文本增加步数提升质量
+                    # --- 优化 2: 降低 CFG 强度减少过度压缩 ---
+                    # 极短文本使用较低的 CFG (0.6-0.7) 来保留自然的语调和时长
+                    # 过高的 CFG 会强制对齐，导致发音急促
+                    inference_cfg_rate = 0.65 if current_max_len <= 64 else 0.70
                     latent = self.s2mel.models['gpt_layer'](latent)
                     S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
                     S_infer = S_infer.transpose(1, 2)
                     S_infer = S_infer + latent
-                    # scale = self._calc_dynamic_target_scale(code_lens)
                     # 定义一个基础长度缩放
                     base_scale = self._calc_dynamic_target_scale(code_lens)
-
-                    # 应用用户设定的 final_speed_factor
-                    # 为了避免 "0.5倍速变成50s" (过分拉伸) 的问题，我们对慢速区间采用【线性映射】而非【反比映射】。
-                    # 逻辑如下：
-                    # Speed >= 1.0 (变快): 保持物理反比，例如 2.0 -> 0.5倍时长。
-                    # Speed < 1.0 (变慢): 采用线性插值 Scale = 2.0 - Speed。
-                    #   - Speed = 1.0 -> Scale = 1.0 (不变)
-                    #   - Speed = 0.5 -> Scale = 1.5 (1.5倍时长，而不是原来的2倍)
-                    #   - Speed = 0.0 -> Scale = 2.0 (最多拉伸2倍，彻底杜绝 OOM 和无限长)
 
                     safe_speed = max(min(speed_factor, 2.0), 0.01)  # 限制输入在 0.01-2.0
 
@@ -594,9 +617,9 @@ class IndexTTS2:
                     print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
 
                 # --- 优化: 对单句进行尾部静音裁剪 ---
-                # 仅针对短句开启裁剪，或者全局开启
-                # if code_lens.max().item() <= 64:
-                wav = self.trim_long_silence(wav, sampling_rate=sampling_rate, top_db=20)
+                # 短文本使用更宽松的裁剪阈值，保留自然的尾音
+                trim_db = 25  # 短文本裁剪更温柔
+                wav = self.trim_long_silence(wav, sampling_rate=sampling_rate, top_db=trim_db)
                 # ---------------------------------
 
                 wavs.append(wav.cpu())  # to cpu before saving
