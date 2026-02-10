@@ -242,12 +242,53 @@ class UnifiedVoice(nn.Module):
         mel_start_emb = mel_start_emb + self.mel_pos_embedding(mel_start_emb)
         inputs_embeds = torch.cat([emb, mel_start_emb], dim=1)
 
+        # --- 动态采样参数：根据文本长度调整，防止短文本过度生成和重复幻觉 ---
+        raw_text_len = text_inputs.shape[-1]  # 含 start token 后的长度
+
+        if raw_text_len <= 6:  # ≤2个汉字（含空格分隔符 + start/stop token）
+            # 极短文本：用 25 倍系数严格限制最大 mel token 数
+            dynamic_max_tokens = min(max(raw_text_len * 25, 80), 2048)
+            dynamic_sampling_params = SamplingParams(
+                temperature=0.2,      # 接近贪婪解码，最大化停止信号的确定性
+                top_p=0.5,
+                top_k=15,
+                repetition_penalty=self.sampling_params.repetition_penalty,
+                max_tokens=dynamic_max_tokens,
+                stop_token_ids=[self.stop_mel_token],
+                include_stop_str_in_output=True,
+            )
+        elif raw_text_len <= 14:  # ≤5个汉字
+            dynamic_max_tokens = min(max(raw_text_len * 30, 100), 2048)
+            dynamic_sampling_params = SamplingParams(
+                temperature=0.5,      # 适度降低随机性
+                top_p=0.65,
+                top_k=25,
+                repetition_penalty=self.sampling_params.repetition_penalty,
+                max_tokens=dynamic_max_tokens,
+                stop_token_ids=[self.stop_mel_token],
+                include_stop_str_in_output=True,
+            )
+        else:  # 正常长度文本，保持原有参数
+            dynamic_max_tokens = min(max(raw_text_len * 35, 150), 2048)
+            dynamic_sampling_params = SamplingParams(
+                temperature=self.sampling_params.temperature,
+                top_p=self.sampling_params.top_p,
+                top_k=self.sampling_params.top_k,
+                repetition_penalty=self.sampling_params.repetition_penalty,
+                max_tokens=dynamic_max_tokens,
+                stop_token_ids=[self.stop_mel_token],
+                include_stop_str_in_output=True,
+            )
+
+        logger.info(f"[dynamic params] text_len={raw_text_len}, max_tokens={dynamic_max_tokens}, "
+                     f"temperature={dynamic_sampling_params.temperature}")
+
         fake_inputs = PLACEHOLDER_TOKEN * 1  # [PLACEHOLDER_TOKEN_ID]
         multi_modal_data = {"audio": {"audio_embeds": [inputs_embeds.squeeze(0).cpu()]}}
         tokens_prompt = TokensPrompt(prompt=fake_inputs, multi_modal_data=multi_modal_data)
         # tokens_prompt = TokensPrompt(prompt_token_ids=fake_inputs, multi_modal_data=multi_modal_data)
         request_id = uuid.uuid4().hex
-        output_generator = self.llm.generate(tokens_prompt, sampling_params=self.sampling_params, request_id=request_id)
+        output_generator = self.llm.generate(tokens_prompt, sampling_params=dynamic_sampling_params, request_id=request_id)
         gpt_stt = time.time()
         prefill_flag = True
         async for output in output_generator:

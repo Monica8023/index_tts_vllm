@@ -490,6 +490,23 @@ class IndexTTS2:
                 )
                 gpt_gen_time += time.perf_counter() - m_start_time
 
+                # --- 安全防线: mel code 比率截断 ---
+                # 关键发现：mel code 级别的幻觉不是精确重复（不同 code 编码相似发音），
+                # 滑动窗口匹配无效。改用更可靠的比率截断：
+                # 每个 text token 最多对应 ~16 个 mel code（约 0.29s），超出即为过度生成。
+                raw_code_len = codes.shape[-1]
+                text_token_count = text_tokens.shape[-1]
+                if text_token_count <= 14:
+                    max_codes_per_token = 16  # 每个 text token 最多 16 个 mel code
+                    max_expected_codes = max(text_token_count * max_codes_per_token, 40)
+                    if raw_code_len > max_expected_codes:
+                        logger.warning(
+                            f">> mel code 超出预期比率！text_tokens={text_token_count}, "
+                            f"actual_codes={raw_code_len}, max_expected={max_expected_codes}, "
+                            f"截断至 {max_expected_codes}"
+                        )
+                        codes = codes[:, :max_expected_codes]
+
                 # codes = torch.tensor(codes, dtype=torch.long, device=self.device).unsqueeze(0)
                 code_lens = torch.tensor([codes.shape[-1]], device=codes.device, dtype=codes.dtype)
 
