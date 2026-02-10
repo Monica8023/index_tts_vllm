@@ -327,8 +327,9 @@ async def tts_api_url(request: Request):
                 redis_prefix = data.get("redisPrefix", None)
                 speed_factor = data.get("speedFactor", 1.0)  # 控制语速：>1 更快，<1 更慢
                 volume_gain = float(data.get("volume", 1.0))  # 控制音量：0.0-2.0，1.0为原始音量
+                voice_id = data.get("voiceId", None)
 
-                logger.info(f"[接收请求] 当前需要合成的文本 : {text} redisPrefix : {redis_prefix} ossPrefix : {oss_prefix_key} speed_factor : {speed_factor} volume_gain : {volume_gain}")
+                logger.info(f"[接收请求] 当前需要合成的文本 : {text} redisPrefix : {redis_prefix} ossPrefix : {oss_prefix_key} speed_factor : {speed_factor} volume_gain : {volume_gain} 音色id : {voice_id}")
 
                 if type(emo_control_method) is not int:
                     emo_control_method = emo_control_method.value
@@ -407,6 +408,7 @@ async def tts_api_url(request: Request):
                     "ossUrl": oss_object_key,
                     "redisIndex": fixed_redis_index,
                     "text": text,
+                    "voiceId": voice_id,
                 })
 
             except Exception as item_ex:
@@ -420,6 +422,7 @@ async def tts_api_url(request: Request):
                     "redisIndex": redis_prefix,
                     "text": text,
                     "error": str(item_ex),
+                    "voiceId": voice_id,
                 })
 
         # 统一清理本批次下载的临时文件
