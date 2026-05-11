@@ -47,7 +47,7 @@ from vllm.v1.engine.async_llm import AsyncLLM
 class IndexTTS2:
     def __init__(
             self, model_dir="checkpoints", is_fp16=False, device=None, use_cuda_kernel=None,
-            gpu_memory_utilization=0.25, qwenemo_gpu_memory_utilization=0.10
+            gpu_memory_utilization=0.25, qwenemo_gpu_memory_utilization=0.30
     ):
         """
         Args:
@@ -90,7 +90,7 @@ class IndexTTS2:
             tensor_parallel_size=1,
             dtype="auto",
             gpu_memory_utilization=gpu_memory_utilization,
-            # enforce_eager=True,
+            enforce_eager=True,
         )
         indextts_vllm = AsyncLLM.from_engine_args(engine_args)
 
@@ -240,12 +240,12 @@ class IndexTTS2:
                 current_duration_ms = wav.size(-1) / sampling_rate * 1000
 
                 # 动态计算停顿时长：
-                # - 极短句（<500ms）：使用 1.5x 基础停顿，避免听起来太赶
+                # - 极短句（<500ms）：使用 1.3x 基础停顿，避免听起来太赶
                 # - 短句（500ms-1s）：使用 1.2x 基础停顿
                 # - 正常句（1s-3s）：使用 1.0x 基础停顿
                 # - 长句（>3s）：使用 0.8x 基础停顿，避免间隙过长
                 if current_duration_ms < 500:
-                    silence_factor = 1.5
+                    silence_factor = 1.3
                 elif current_duration_ms < 1000:
                     silence_factor = 1.2
                 elif current_duration_ms < 3000:
@@ -497,7 +497,7 @@ class IndexTTS2:
                 raw_code_len = codes.shape[-1]
                 text_token_count = text_tokens.shape[-1]
                 if text_token_count <= 14:
-                    max_codes_per_token = 16  # 每个 text token 最多 16 个 mel code
+                    max_codes_per_token = 18  # 每个 text token 最多 16 个 mel code
                     max_expected_codes = max(text_token_count * max_codes_per_token, 40)
                     if raw_code_len > max_expected_codes:
                         logger.warning(
@@ -699,7 +699,7 @@ def find_most_similar_cosine(query_vector, matrix):
 
 
 class QwenEmotion:
-    def __init__(self, model_dir, gpu_memory_utilization=0.1):
+    def __init__(self, model_dir, gpu_memory_utilization = 0.3):
         self.model_dir = model_dir
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
 
@@ -715,7 +715,8 @@ class QwenEmotion:
             tensor_parallel_size=1,
             dtype="auto",
             gpu_memory_utilization=gpu_memory_utilization,
-            max_model_len=2048,
+            enforce_eager=True,
+            max_model_len=1024,
         )
         self.model = AsyncLLM.from_engine_args(engine_args)
 
